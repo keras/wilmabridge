@@ -1,0 +1,116 @@
+{
+  "request": {
+    "model": "gemini-3.5-flash-lite",
+    "input": "Olet kouluviestien jäsentäjä. Poimi viestistä päivämäärälliset tapahtumat.\nSÄÄNNÖT:\n- Älä koskaan päättele vuotta. Palauta päivämäärä täsmälleen kirjoitetussa muodossa.\n- Älä koskaan luettele toistuvia tapahtumia; palauta recurrence {freq,count}.\n- Palauta weekday_claim jos viestissä lukee viikonpäivä (ma/ti/ke/to/pe/la/su).\n- items vain jos ne on nimenomaisesti mainittu.\n- quote = sanatarkka lainaus viestistä.\n\nVIESTI:\nOtsikko: STM kysely oppilaiden vanhemmille\nLapsenne luokka osallistuu STM:n teettämään kyselyyn kouluhyvinvoinnista. Vastaaminen vie n. 10 minuuttia. Vastausaikaa 14.4. asti.",
+    "response_format": {
+      "type": "text",
+      "mime_type": "application/json",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "candidates": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "kind": {
+                  "type": "string",
+                  "enum": [
+                    "event",
+                    "deadline",
+                    "exam",
+                    "info"
+                  ]
+                },
+                "title": {
+                  "type": "string"
+                },
+                "detail": {
+                  "type": "string"
+                },
+                "date": {
+                  "type": "string"
+                },
+                "weekday_claim": {
+                  "type": "string"
+                },
+                "items": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                },
+                "recurrence": {
+                  "type": "object",
+                  "properties": {
+                    "freq": {
+                      "type": "string",
+                      "enum": [
+                        "daily",
+                        "weekly",
+                        "biweekly",
+                        "monthly"
+                      ]
+                    },
+                    "count": {
+                      "type": "integer"
+                    }
+                  },
+                  "required": [
+                    "freq",
+                    "count"
+                  ],
+                  "description": "Toistuvuus. count = montako kertaa yhteensä. Jätä pois jos kertaluontoinen."
+                },
+                "confidence": {
+                  "type": "number"
+                },
+                "quote": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "kind",
+                "title",
+                "date",
+                "confidence",
+                "quote"
+              ]
+            }
+          }
+        },
+        "required": [
+          "candidates"
+        ]
+      }
+    }
+  },
+  "response": {
+    "id": "v1_RECONSTRUCTED_FROM_TRANSCRIPT",
+    "status": "completed",
+    "usage": {
+      "total_tokens": 250,
+      "total_input_tokens": 230,
+      "total_output_tokens": 20
+    },
+    "created": "2026-08-13T17:40:58Z",
+    "steps": [
+      {
+        "signature": "RECONSTRUCTED",
+        "type": "thought"
+      },
+      {
+        "content": [
+          {
+            "text": "{\"candidates\": [{\"kind\": \"deadline\", \"title\": \"STM kysely oppilaiden vanhemmille\", \"date\": \"14.4.\", \"confidence\": 1.0, \"quote\": \"Vastausaikaa 14.4. asti.\", \"detail\": \"Kyselyyn vastaaminen vie n. 10 minuuttia.\"}]}",
+            "type": "text"
+          }
+        ],
+        "type": "model_output"
+      }
+    ],
+    "object": "interaction",
+    "model": "gemini-3.5-flash-lite"
+  },
+  "_note": "response reconstructed from conversation transcript; see internal/extract/testdata/README.md"
+}

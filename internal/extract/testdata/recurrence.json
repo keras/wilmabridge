@@ -1,0 +1,127 @@
+{
+  "request": {
+    "model": "gemini-3.5-flash-lite",
+    "input": "Olet kouluviestien jäsentäjä. Poimi viestistä päivämäärälliset tapahtumat.\nSÄÄNNÖT:\n- Älä koskaan päättele vuotta. Palauta päivämäärä täsmälleen kirjoitetussa muodossa.\n- Älä koskaan luettele toistuvia tapahtumia; palauta recurrence {freq,count}.\n- Palauta weekday_claim jos viestissä lukee viikonpäivä (ma/ti/ke/to/pe/la/su).\n- items vain jos ne on nimenomaisesti mainittu.\n- quote = sanatarkka lainaus viestistä.\n\nVIESTI:\nOtsikko: Neljä uintivuoroa\nAlkaen 10.10. neljänä perättäisenä viikkona liikuntatunnilla on uintia. Mukaan uimahousut, pyyhe ja uimalasit. Muistattehan myös suihkun.\n",
+    "response_format": {
+      "type": "text",
+      "mime_type": "application/json",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "candidates": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "kind": {
+                  "type": "string",
+                  "enum": [
+                    "event",
+                    "deadline",
+                    "exam",
+                    "info"
+                  ]
+                },
+                "title": {
+                  "type": "string"
+                },
+                "detail": {
+                  "type": "string"
+                },
+                "date": {
+                  "type": "string"
+                },
+                "weekday_claim": {
+                  "type": "string"
+                },
+                "items": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                },
+                "recurrence": {
+                  "type": "object",
+                  "properties": {
+                    "freq": {
+                      "type": "string",
+                      "enum": [
+                        "daily",
+                        "weekly",
+                        "biweekly",
+                        "monthly"
+                      ]
+                    },
+                    "count": {
+                      "type": "integer"
+                    }
+                  },
+                  "required": [
+                    "freq",
+                    "count"
+                  ],
+                  "description": "Toistuvuus. count = montako kertaa yhteensä. Jätä pois jos kertaluontoinen."
+                },
+                "confidence": {
+                  "type": "number"
+                },
+                "quote": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "kind",
+                "title",
+                "date",
+                "confidence",
+                "quote"
+              ]
+            }
+          }
+        },
+        "required": [
+          "candidates"
+        ]
+      }
+    }
+  },
+  "response": {
+    "id": "v1_ChduZ0YtYXZpV0VPcjJ4TjhQMjVMT3dRNBIXbmdGLWF2aVdFT3IyeE44UDI1TE93UTQ",
+    "status": "completed",
+    "usage": {
+      "total_tokens": 380,
+      "total_input_tokens": 216,
+      "input_tokens_by_modality": [
+        {
+          "modality": "text",
+          "tokens": 216
+        }
+      ],
+      "total_cached_tokens": 0,
+      "total_output_tokens": 164,
+      "total_tool_use_tokens": 0,
+      "total_thought_tokens": 0,
+      "raw_prompt_token": 651
+    },
+    "created": "2026-08-13T17:40:46Z",
+    "updated": "2026-08-13T17:40:46Z",
+    "service_tier": "standard",
+    "steps": [
+      {
+        "signature": "El4KXAERTTIP841aVgOH0b4qDgVnKSk+mGe4/HZsre9nId0rVDBGmki26eGwJSXRojkDp5DKeJNV91Lcn7INS95+7TdLLmuRZwI+UTbz0Q+wR76HEnjNP0vietQNR9CO",
+        "type": "thought"
+      },
+      {
+        "content": [
+          {
+            "text": "{\n  \"candidates\": [\n    {\n      \"kind\": \"event\",\n      \"title\": \"Uintivuoro\",\n      \"date\": \"10.10.\",\n      \"confidence\": 1.0,\n      \"quote\": \"Alkaen 10.10. neljänä perättäisenä viikkona liikuntatunnilla on uintia.\",\n      \"detail\": \"Liikuntatunnilla\",\n      \"items\": [\n        \"uimahousut\",\n        \"pyyhe\",\n        \"uimalasit\"\n      ],\n      \"recurrence\": {\n        \"freq\": \"weekly\",\n        \"count\": 4\n      }\n    }\n  ]\n}",
+            "type": "text"
+          }
+        ],
+        "type": "model_output"
+      }
+    ],
+    "object": "interaction",
+    "model": "gemini-3.5-flash-lite"
+  }
+}

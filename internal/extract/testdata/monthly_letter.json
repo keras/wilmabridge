@@ -1,0 +1,116 @@
+{
+  "request": {
+    "model": "gemini-3.5-flash-lite",
+    "input": "Olet kouluviestien jäsentäjä. Poimi viestistä päivämäärälliset tapahtumat.\nSÄÄNNÖT:\n- Älä koskaan päättele vuotta. Palauta päivämäärä täsmälleen kirjoitetussa muodossa.\n- Älä koskaan luettele toistuvia tapahtumia; palauta recurrence {freq,count}.\n- Palauta weekday_claim jos viestissä lukee viikonpäivä (ma/ti/ke/to/pe/la/su).\n- items vain jos ne on nimenomaisesti mainittu.\n- quote = sanatarkka lainaus viestistä.\n\nVIESTI:\nOtsikko: Maaliskuun kuukausikirje\nke 4.3. vietämme talviliikuntapäivää Leppävaaran urheilupuistossa. Mukaan sukset tai luistimet ja kypärä.\nto 5.3. Matematiikan koe, murtoluvut\nti 17.3. pyhän Patrikin päivä, voi pukeutua vihreään\npe 20.3. kirjastoretki, kirjat ja kirjastokortti mukaan",
+    "response_format": {
+      "type": "text",
+      "mime_type": "application/json",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "candidates": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "kind": {
+                  "type": "string",
+                  "enum": [
+                    "event",
+                    "deadline",
+                    "exam",
+                    "info"
+                  ]
+                },
+                "title": {
+                  "type": "string"
+                },
+                "detail": {
+                  "type": "string"
+                },
+                "date": {
+                  "type": "string"
+                },
+                "weekday_claim": {
+                  "type": "string"
+                },
+                "items": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                },
+                "recurrence": {
+                  "type": "object",
+                  "properties": {
+                    "freq": {
+                      "type": "string"
+                    },
+                    "count": {
+                      "type": "integer"
+                    }
+                  }
+                },
+                "confidence": {
+                  "type": "number"
+                },
+                "quote": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "kind",
+                "title",
+                "date",
+                "confidence",
+                "quote"
+              ]
+            }
+          }
+        },
+        "required": [
+          "candidates"
+        ]
+      }
+    }
+  },
+  "response": {
+    "id": "v1_ChdmUUYtYW9TRkZfdk9uc0VQbk42bW1BSRIXZlFGLWFvU0ZGX3ZPbnNFUG5ONm1tQUk",
+    "status": "completed",
+    "usage": {
+      "total_tokens": 725,
+      "total_input_tokens": 266,
+      "input_tokens_by_modality": [
+        {
+          "modality": "text",
+          "tokens": 266
+        }
+      ],
+      "total_cached_tokens": 0,
+      "total_output_tokens": 459,
+      "total_tool_use_tokens": 0,
+      "total_thought_tokens": 0,
+      "raw_prompt_token": 634
+    },
+    "created": "2026-08-13T17:40:13Z",
+    "updated": "2026-08-13T17:40:13Z",
+    "service_tier": "standard",
+    "steps": [
+      {
+        "signature": "El4KXAERTTIPqlf2R0yuwuHLMLEjtVEv1hxPszNtDv1IG2tipN45XvmkcP4J53cZ9ygnkd4DxoLimXlhHgF/aiwozS2jKi5g7BWzdmQjDEOleVJ/AsIsJLIQHd4spLRJ",
+        "type": "thought"
+      },
+      {
+        "content": [
+          {
+            "text": "{\n  \"candidates\": [\n    {\n      \"kind\": \"event\",\n      \"title\": \"talviliikuntapäivä\",\n      \"date\": \"4.3.\",\n      \"confidence\": 1.0,\n      \"quote\": \"ke 4.3. vietämme talviliikuntapäivää Leppävaaran urheilupuistossa. Mukaan sukset tai luistimet ja kypärä.\",\n      \"detail\": \"Leppävaaran urheilupuisto\",\n      \"items\": [\n        \"sukset tai luistimet\",\n        \"kypärä\"\n      ],\n      \"weekday_claim\": \"ke\"\n    },\n    {\n      \"kind\": \"exam\",\n      \"title\": \"Matematiikan koe, murtoluvut\",\n      \"date\": \"5.3.\",\n      \"confidence\": 1.0,\n      \"quote\": \"to 5.3. Matematiikan koe, murtoluvut\",\n      \"weekday_claim\": \"to\"\n    },\n    {\n      \"kind\": \"event\",\n      \"title\": \"pyhän Patrikin päivä\",\n      \"date\": \"17.3.\",\n      \"confidence\": 1.0,\n      \"quote\": \"ti 17.3. pyhän Patrikin päivä, voi pukeutua vihreään\",\n      \"detail\": \"Voi pukeutua vihreään\",\n      \"weekday_claim\": \"ti\"\n    },\n    {\n      \"kind\": \"event\",\n      \"title\": \"kirjastoretki\",\n      \"date\": \"20.3.\",\n      \"confidence\": 1.0,\n      \"quote\": \"pe 20.3. kirjastoretki, kirjat ja kirjastokortti mukaan\",\n      \"items\": [\n        \"kirjat\",\n        \"kirjastokortti\"\n      ],\n      \"weekday_claim\": \"pe\"\n    }\n  ]\n}",
+            "type": "text"
+          }
+        ],
+        "type": "model_output"
+      }
+    ],
+    "object": "interaction",
+    "model": "gemini-3.5-flash-lite"
+  }
+}

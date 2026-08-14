@@ -1,0 +1,127 @@
+{
+  "request": {
+    "model": "gemini-3.5-flash-lite",
+    "input": "Olet kouluviestien jäsentäjä. Poimi viestistä päivämäärälliset tapahtumat.\nSÄÄNNÖT:\n- Älä koskaan päättele vuotta. Palauta päivämäärä täsmälleen kirjoitetussa muodossa.\n- Älä koskaan luettele toistuvia tapahtumia; palauta recurrence {freq,count}.\n- Palauta weekday_claim jos viestissä lukee viikonpäivä (ma/ti/ke/to/pe/la/su).\n- items vain jos ne on nimenomaisesti mainittu.\n- quote = sanatarkka lainaus viestistä.\n\nVIESTI:\nOtsikko: Kouluterveydenhoitajan info\nHei huoltajat! Olen koulunne terveydenhoitaja Saara. Tavoitatte minut Wilman kautta tai puhelimitse. Vastaanotto on koulun A-siivessä. Mukavaa lukuvuotta!",
+    "response_format": {
+      "type": "text",
+      "mime_type": "application/json",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "candidates": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "kind": {
+                  "type": "string",
+                  "enum": [
+                    "event",
+                    "deadline",
+                    "exam",
+                    "info"
+                  ]
+                },
+                "title": {
+                  "type": "string"
+                },
+                "detail": {
+                  "type": "string"
+                },
+                "date": {
+                  "type": "string"
+                },
+                "weekday_claim": {
+                  "type": "string"
+                },
+                "items": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                },
+                "recurrence": {
+                  "type": "object",
+                  "properties": {
+                    "freq": {
+                      "type": "string",
+                      "enum": [
+                        "daily",
+                        "weekly",
+                        "biweekly",
+                        "monthly"
+                      ]
+                    },
+                    "count": {
+                      "type": "integer"
+                    }
+                  },
+                  "required": [
+                    "freq",
+                    "count"
+                  ],
+                  "description": "Toistuvuus. count = montako kertaa yhteensä. Jätä pois jos kertaluontoinen."
+                },
+                "confidence": {
+                  "type": "number"
+                },
+                "quote": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "kind",
+                "title",
+                "date",
+                "confidence",
+                "quote"
+              ]
+            }
+          }
+        },
+        "required": [
+          "candidates"
+        ]
+      }
+    }
+  },
+  "response": {
+    "id": "v1_Chd0d0YtYW9PbUM0Q05rZFVQMUp6Zm1BSRIXdHdGLWFvT21DNENOa2RVUDFKemZtQUk",
+    "status": "completed",
+    "usage": {
+      "total_tokens": 223,
+      "total_input_tokens": 214,
+      "input_tokens_by_modality": [
+        {
+          "modality": "text",
+          "tokens": 214
+        }
+      ],
+      "total_cached_tokens": 0,
+      "total_output_tokens": 9,
+      "total_tool_use_tokens": 0,
+      "total_thought_tokens": 0,
+      "raw_prompt_token": 649
+    },
+    "created": "2026-08-13T17:41:11Z",
+    "updated": "2026-08-13T17:41:11Z",
+    "service_tier": "standard",
+    "steps": [
+      {
+        "signature": "El4KXAERTTIPmKix1y0/7b2LLO41RNlzIr3BFxozcRr9p7O09GnQvFF0/y/o8k9P7Jpvo5DKVptwl/astPE30yEw+P6pcYpcp2/kBOqLIh27Nrxh8nMjciI4GWvKG2Tb",
+        "type": "thought"
+      },
+      {
+        "content": [
+          {
+            "text": "{\n  \"candidates\": []\n}",
+            "type": "text"
+          }
+        ],
+        "type": "model_output"
+      }
+    ],
+    "object": "interaction",
+    "model": "gemini-3.5-flash-lite"
+  }
+}

@@ -1,0 +1,7 @@
+.env
+*.db
+*.db-wal
+*.db-shm
+messages.json
+/wilmabridge
+openclaw-integration.md
