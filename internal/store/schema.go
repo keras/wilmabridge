@@ -88,4 +88,17 @@ CREATE TABLE IF NOT EXISTS sync_state (
   last_id    INTEGER NOT NULL,
   updated_at TEXT    NOT NULL
 );
+
+-- poll_state records when poll last successfully reached each role,
+-- independent of sync_state's high-water mark. Kept as its own table
+-- (rather than a column added to sync_state) so a poll that ran but found
+-- nothing new can never be mistaken for a high-water mark of 0 -- which
+-- would make HighWaterMark report the role as already having a mark, and
+-- so skip the bootstrap window and fetch (and mark read) the entire
+-- folder. It also means a plain "IF NOT EXISTS" is enough for a database
+-- created by an older wilmabridge: no ALTER TABLE migration needed.
+CREATE TABLE IF NOT EXISTS poll_state (
+  role           TEXT PRIMARY KEY,
+  last_polled_at TEXT NOT NULL
+);
 `

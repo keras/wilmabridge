@@ -14,15 +14,20 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
+	"os/signal"
 	"sort"
+	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"wilmabridge/internal/extract"
 	"wilmabridge/internal/gemini"
+	"wilmabridge/internal/poll"
 	"wilmabridge/internal/store"
 	"wilmabridge/internal/wilma"
 )
@@ -44,6 +49,8 @@ func run(args []string) int {
 	switch cmd {
 	case "sync":
 		return cmdSync(rest)
+	case "poll":
+		return cmdPoll(rest)
 	case "roles":
 		return cmdRoles(rest)
 	case "probe":
@@ -71,6 +78,8 @@ func printUsage() {
 
 Usage:
   wilmabridge sync    [flags]   fetch messages, print NDJSON (default command)
+  wilmabridge poll    [flags]   incrementally fetch new messages into -db and exit
+                                 (--interval keeps polling); no extraction
   wilmabridge roles   [flags]   discover and print guardian roles (one per child)
   wilmabridge probe   [flags]   log in and dump raw endpoint responses (debugging)
   wilmabridge extract [flags]   read sync's NDJSON on stdin, print extracted dated
@@ -81,7 +90,8 @@ Usage:
   wilmabridge ingest  [flags]   read sync's NDJSON on stdin, store it in -db
                                  (dedup across children; queue for extraction)
   wilmabridge review  [flags]   print events flagged needs_review from -db
-  wilmabridge db last-id [flags]  print the stored per-role high-water mark(s)
+  wilmabridge db last-id [flags]     print the stored per-role high-water mark(s)
+  wilmabridge db set-last-id [flags] <id>  manually advance a role's high-water mark
 
 Credentials (required, env only):
   WILMA_USER       Wilma username
@@ -95,6 +105,10 @@ Persistent pipeline (dedup + a durable review queue):
   wilmabridge sync --since 168h | wilmabridge ingest --db wilma.db
   wilmabridge extract --db wilma.db
   wilmabridge review --db wilma.db
+
+Polling pipeline (cron-friendly, keeps -db in sync with no bookkeeping):
+  wilmabridge poll --db wilma.db
+  wilmabridge extract --db wilma.db
 
 Run 'wilmabridge sync -h' etc. for flags.
 `)
@@ -252,6 +266,288 @@ func cmdSync(args []string) int {
 	}
 
 	return exitCode
+}
+
+// wilmaSource adapts *wilma.Client to poll.Source. It exists only because
+// ListFolder returns an unexported slice type, so poll cannot name it in an
+// interface the way cmdSync's inline loop does.
+type wilmaSource struct {
+	c    *wilma.Client
+	host string
+}
+
+func (s wilmaSource) List(prefix, child string) ([]wilma.Message, error) {
+	list, err := s.c.ListFolder(prefix, "")
+	if err != nil {
+		return nil, err
+	}
+	return wilma.ToMessages(prefix, child, s.host, list), nil
+}
+
+func (s wilmaSource) FillBody(prefix string, m *wilma.Message) error {
+	return wilma.FillBody(s.c, prefix, m)
+}
+
+// buildPollRoles narrows the account's discovered roles to the ones poll
+// should act on and attaches each one's display label, exactly as cmdSync
+// does inline for its own loop.
+func buildPollRoles(roles []wilma.Role, labels map[string]string, roleSet map[string]bool) []poll.Role {
+	var out []poll.Role
+	for _, r := range roles {
+		if len(roleSet) > 0 && !roleSet[normalizeRolePrefix(r.Prefix)] {
+			continue
+		}
+		name := r.Name
+		if l, ok := labels[r.Prefix]; ok && l != "" {
+			name = l
+		}
+		out = append(out, poll.Role{Prefix: r.Prefix, Name: name})
+	}
+	return out
+}
+
+func rolePrefixSet(roleFilter repeatedFlag) map[string]bool {
+	set := map[string]bool{}
+	for _, r := range roleFilter {
+		set[normalizeRolePrefix(r)] = true
+	}
+	return set
+}
+
+// pollWarn prints an operational warning unconditionally, unlike -v detail:
+// used for anything with a real side effect the user should see regardless
+// of flags (currently: fetching bodies for a role's bootstrap window, which
+// marks those messages read in Wilma).
+func pollWarn(format string, args ...any) {
+	fmt.Fprintf(os.Stderr, "wilmabridge: poll: "+format+"\n", args...)
+}
+
+// reportPollResult prints a summary of one pass to stderr — nothing at all
+// for a clean no-op pass (under cron, output means mail), one line per
+// role that stored something or failed otherwise, plus a totals line when
+// there's anything to report or -v is set. Returns the process exit code
+// for this pass: 1 if any role failed, 0 otherwise.
+func reportPollResult(res poll.Result, verbose bool) int {
+	listed, _, ingested, newCount, failed := res.Totals()
+	if !verbose && res.Quiet() {
+		return 0
+	}
+
+	for _, rr := range res.Roles {
+		name := rr.Name
+		if name == "" {
+			name = "(unnamed)"
+		}
+		if rr.Err != nil {
+			fmt.Fprintf(os.Stderr, "wilmabridge: poll: %s (%s): %v\n", rr.Role, name, rr.Err)
+			continue
+		}
+		if !verbose && rr.Ingested == 0 {
+			continue
+		}
+		fmt.Fprintf(os.Stderr, "wilmabridge: poll: %s (%s): listed=%d new=%d ingested=%d mark %d -> %d\n",
+			rr.Role, name, rr.Listed, rr.New, rr.Ingested, rr.MarkBefore, rr.MarkAfter)
+	}
+	fmt.Fprintf(os.Stderr, "wilmabridge: poll: %d roles, %d listed, %d stored (%d distinct new), %d errors, %s\n",
+		len(res.Roles), listed, ingested, newCount, failed, res.Finished.Sub(res.Started).Round(10*time.Millisecond))
+
+	if failed > 0 {
+		return 1
+	}
+	return 0
+}
+
+// cmdPoll incrementally fetches new messages into -db and exits (or, with
+// -interval, keeps doing so on a timer). Unlike sync, it always opens the
+// database: each role's high-water mark there is exactly what makes it
+// possible to fetch only what's newer than last time, without any
+// external bookkeeping like cmdSync's --after requires. See -h and
+// README.md's "poll: automatic incremental sync" section for the full
+// algorithm and its trade-offs.
+func cmdPoll(args []string) int {
+	fs := flag.NewFlagSet("poll", flag.ContinueOnError)
+	host := fs.String("host", os.Getenv("WILMA_HOST"), "Wilma host, e.g. espoo.inschool.fi (default: $WILMA_HOST)")
+	dbPath := fs.String("db", os.Getenv("WILMA_DB"), "SQLite database path (default: $WILMA_DB)")
+	bootstrap := fs.Duration("bootstrap", 720*time.Hour, "time window used only on a role's first ever poll (0 disables the cutoff)")
+	fromNow := fs.Bool("from-now", false, "on a role's first ever poll, record the newest message id and fetch nothing")
+	interval := fs.Duration("interval", 0, "if >0, keep polling on this interval instead of exiting after one pass (minimum 1m)")
+	var roleFilter repeatedFlag
+	fs.Var(&roleFilter, "role", "restrict to one role prefix (e.g. !012345); repeatable")
+	children := fs.String("children", os.Getenv("WILMA_CHILDREN"), "role label map \"!id=Name,!id=Name\" (default: $WILMA_CHILDREN)")
+	bodies := fs.Bool("bodies", true, "fetch full message bodies (false = metadata only; see README's poll section)")
+	delay := fs.Duration("delay", 300*time.Millisecond, "pause between HTTP requests")
+	verbose := fs.Bool("v", false, "log requests and per-role/per-message detail to stderr")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+
+	if *host == "" {
+		fmt.Fprintln(os.Stderr, "wilmabridge: --host or $WILMA_HOST is required")
+		return 2
+	}
+	if *dbPath == "" {
+		fmt.Fprintln(os.Stderr, "wilmabridge: --db or $WILMA_DB is required")
+		return 2
+	}
+	if *bootstrap < 0 {
+		fmt.Fprintln(os.Stderr, "wilmabridge: --bootstrap must not be negative")
+		return 2
+	}
+	if *interval != 0 && *interval < time.Minute {
+		fmt.Fprintln(os.Stderr, "wilmabridge: --interval must be at least 1m (0 disables it, meaning one pass then exit)")
+		return 2
+	}
+	user, pass, ok := credentials()
+	if !ok {
+		return 2
+	}
+
+	st, err := store.Open(*dbPath)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "wilmabridge:", err)
+		return 1
+	}
+	defer st.Close()
+
+	if !*bodies {
+		pollWarn("--bodies=false stores messages without a body; they are recorded extract_state=skipped and the high-water " +
+			"mark still advances, so `extract` will never see them. To backfill bodies later: " +
+			"wilmabridge sync --since 720h | wilmabridge ingest")
+	}
+
+	opt := poll.Options{
+		Bootstrap: *bootstrap,
+		FromNow:   *fromNow,
+		Bodies:    *bodies,
+		Delay:     *delay,
+		Warn:      pollWarn,
+	}
+	if *verbose {
+		opt.Log = func(format string, args ...any) { fmt.Fprintf(os.Stderr, format+"\n", args...) }
+	}
+
+	roleLabels := parseChildren(*children)
+	roleSet := rolePrefixSet(roleFilter)
+
+	if *interval > 0 {
+		return pollLoop(*host, user, pass, roleLabels, roleSet, st, opt, *interval, *verbose)
+	}
+
+	log := verboseLogger(*verbose)
+	client, err := wilma.NewClient(*host, log)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "wilmabridge:", err)
+		return 1
+	}
+	roles, err := client.LoginAndDiscoverRoles(user, pass)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "wilmabridge: poll: login failed:", err)
+		return 1
+	}
+	defer client.Logout()
+
+	pollRoles := buildPollRoles(roles, roleLabels, roleSet)
+	src := wilmaSource{c: client, host: *host}
+
+	res, passErr := poll.Pass(context.Background(), src, st, pollRoles, opt)
+	exitCode := reportPollResult(res, *verbose)
+	if passErr != nil {
+		fmt.Fprintln(os.Stderr, "wilmabridge: poll:", passErr)
+		return 1
+	}
+	return exitCode
+}
+
+// pollLoop keeps polling on a timer until interrupted (SIGINT/SIGTERM) or a
+// setup failure. It owns the Wilma session's whole lifecycle, including
+// transparently logging back in when a pass reports wilma.ErrSessionExpired
+// — the expected way for a long-running poller to find out its session
+// died, since Wilma sessions time out well before a human would notice.
+func pollLoop(host, user, pass string, roleLabels map[string]string, roleSet map[string]bool, st *store.Store, opt poll.Options, interval time.Duration, verbose bool) int {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	log := verboseLogger(verbose)
+
+	var (
+		client    *wilma.Client
+		pollRoles []poll.Role
+	)
+	// login (re)establishes the session and refreshes the role list, so a
+	// child added to the account mid-run gets picked up on the next login
+	// rather than requiring a restart.
+	login := func() error {
+		c, err := wilma.NewClient(host, log)
+		if err != nil {
+			return err
+		}
+		roles, err := c.LoginAndDiscoverRoles(user, pass)
+		if err != nil {
+			return err
+		}
+		client = c
+		pollRoles = buildPollRoles(roles, roleLabels, roleSet)
+		return nil
+	}
+
+	if err := login(); err != nil {
+		fmt.Fprintln(os.Stderr, "wilmabridge: poll: login failed:", err)
+		return 1
+	}
+	defer func() {
+		if client != nil {
+			client.Logout()
+		}
+	}()
+
+	runPass := func() error {
+		src := wilmaSource{c: client, host: host}
+		res, err := poll.Pass(ctx, src, st, pollRoles, opt)
+		reportPollResult(res, verbose)
+		return err
+	}
+
+	failedLogins := 0
+	for {
+		if err := runPass(); err != nil {
+			if ctx.Err() != nil {
+				return 0 // requested shutdown mid-pass; not a failure
+			}
+			if errors.Is(err, wilma.ErrSessionExpired) {
+				fmt.Fprintln(os.Stderr, "wilmabridge: poll: session expired, logging in again")
+				client.Logout()
+				if err := login(); err != nil {
+					failedLogins++
+					fmt.Fprintln(os.Stderr, "wilmabridge: poll: re-login failed:", err)
+					if failedLogins >= 5 {
+						fmt.Fprintln(os.Stderr, "wilmabridge: poll: giving up after 5 consecutive failed logins")
+						return 1
+					}
+				} else {
+					failedLogins = 0
+					// One immediate retry with the fresh session, so a
+					// mid-run expiry doesn't cost a whole --interval of
+					// staleness. If it fails again too, wait for the next
+					// tick rather than looping tightly.
+					if err := runPass(); err != nil && ctx.Err() == nil {
+						fmt.Fprintln(os.Stderr, "wilmabridge: poll:", err)
+					} else if ctx.Err() != nil {
+						return 0
+					}
+				}
+			} else {
+				// Pass only returns a non-ctx error for ErrSessionExpired,
+				// but handle the general case defensively.
+				fmt.Fprintln(os.Stderr, "wilmabridge: poll:", err)
+			}
+		}
+
+		select {
+		case <-ctx.Done():
+			return 0
+		case <-time.After(interval):
+		}
+	}
 }
 
 func cmdRoles(args []string) int {
@@ -646,18 +942,20 @@ func cmdReview(args []string) int {
 	return 0
 }
 
-// cmdDB dispatches "db" subcommands. Currently just last-id; the namespace
-// exists so future inspection commands (stats, agenda, ...) have a home
-// that isn't the top-level command list.
+// cmdDB dispatches "db" subcommands: last-id (inspect) and set-last-id
+// (manual override); the namespace exists so future inspection commands
+// (stats, agenda, ...) have a home that isn't the top-level command list.
 func cmdDB(args []string) int {
 	if len(args) == 0 {
-		fmt.Fprintln(os.Stderr, "wilmabridge: db: expected a subcommand (last-id)")
+		fmt.Fprintln(os.Stderr, "wilmabridge: db: expected a subcommand (last-id, set-last-id)")
 		return 2
 	}
 	sub, rest := args[0], args[1:]
 	switch sub {
 	case "last-id":
 		return cmdDBLastID(rest)
+	case "set-last-id":
+		return cmdDBSetLastID(rest)
 	default:
 		fmt.Fprintf(os.Stderr, "wilmabridge: db: unknown subcommand %q\n", sub)
 		return 2
@@ -702,9 +1000,84 @@ func cmdDBLastID(args []string) int {
 		fmt.Fprintln(os.Stderr, "wilmabridge:", err)
 		return 1
 	}
-	for role, id := range all {
-		fmt.Printf("%s\t%d\n", role, id)
+	polled, err := st.AllLastPolledAt()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "wilmabridge:", err)
+		return 1
 	}
+	roles := make([]string, 0, len(all))
+	for role := range all {
+		roles = append(roles, role)
+	}
+	sort.Strings(roles)
+	for _, role := range roles {
+		lastPolled := "-"
+		if t, ok := polled[role]; ok {
+			lastPolled = t.Format(time.RFC3339)
+		}
+		fmt.Printf("%s\t%d\t%s\n", role, all[role], lastPolled)
+	}
+	return 0
+}
+
+// cmdDBSetLastID manually advances a role's high-water mark. It exists as
+// the escape hatch for a role poll has stopped polling because one message
+// keeps failing to fetch (see poll's "why a body-fetch error stops the
+// role" design note): pointing the mark past the poison message lets poll
+// resume without it. SetHighWaterMark never moves a mark backward, so this
+// cannot be used to accidentally roll one back and re-fetch history.
+func cmdDBSetLastID(args []string) int {
+	fs := flag.NewFlagSet("db set-last-id", flag.ContinueOnError)
+	dbPath := fs.String("db", os.Getenv("WILMA_DB"), "SQLite database path (default: $WILMA_DB)")
+	role := fs.String("role", "", "role prefix to set the mark for (e.g. !012345); required")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	if *dbPath == "" {
+		fmt.Fprintln(os.Stderr, "wilmabridge: --db or $WILMA_DB is required")
+		return 2
+	}
+	if *role == "" {
+		fmt.Fprintln(os.Stderr, "wilmabridge: --role is required")
+		return 2
+	}
+	if fs.NArg() != 1 {
+		fmt.Fprintln(os.Stderr, "wilmabridge: db set-last-id: expected exactly one argument, the new id")
+		return 2
+	}
+	id, err := strconv.ParseInt(fs.Arg(0), 10, 64)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "wilmabridge: db set-last-id: %q is not a valid id: %v\n", fs.Arg(0), err)
+		return 2
+	}
+
+	st, err := store.Open(*dbPath)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "wilmabridge:", err)
+		return 1
+	}
+	defer st.Close()
+
+	normalized := normalizeRolePrefix(*role)
+	before, hadMark, err := st.HighWaterMark(normalized)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "wilmabridge:", err)
+		return 1
+	}
+	if err := st.SetHighWaterMark(normalized, id); err != nil {
+		fmt.Fprintln(os.Stderr, "wilmabridge:", err)
+		return 1
+	}
+	after, _, err := st.HighWaterMark(normalized)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "wilmabridge:", err)
+		return 1
+	}
+	if hadMark && after <= before {
+		fmt.Fprintf(os.Stderr, "wilmabridge: db set-last-id: %d does not advance %s's mark (still %d) — SetHighWaterMark never moves it backward\n", id, normalized, after)
+		return 1
+	}
+	fmt.Printf("%s: %d -> %d\n", normalized, before, after)
 	return 0
 }
 

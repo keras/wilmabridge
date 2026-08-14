@@ -4,10 +4,10 @@ A small, read-only CLI that logs into [Wilma](https://wilma.fi/) (Visma InSchool
 guardian account, prints messages for your children as
 [NDJSON](https://github.com/ndjson/ndjson-spec), and can extract the actionable dated
 events buried in them ("koe torstaina 5.3.") using a Gemini model. Fetching (`sync`) and
-extraction (`extract`) are stateless pipe stages by default — but `extract` and the new
-`ingest`/`review`/`db` commands can optionally persist into a local SQLite file, so the
-same Wilma message landing in both kids' inboxes gets deduplicated and extracted once, and
-nothing needs to be re-processed on every run. See "Persistence" below.
+extraction (`extract`) are stateless pipe stages by default — but `extract` and the
+`ingest`/`review`/`db`/`poll` commands can optionally persist into a local SQLite file, so
+the same Wilma message landing in both kids' inboxes gets deduplicated and extracted once,
+and nothing needs to be re-processed on every run. See "Persistence" and "poll" below.
 
 **Unofficial.** Wilma has no public API for guardians. This talks to the same endpoints
 Wilma's own web client uses, reverse-engineered by observing that client (see also the
@@ -25,6 +25,12 @@ without this side effect. If you want a sync run to never change your Wilma read
 state, use `--bodies=false` — you'll get subject/sender/timestamp but no body text, and
 nothing will be touched.
 
+This applies to `poll` too, and there it's easy to trigger by accident: a first `poll` on
+an empty database fetches bodies for every message in its `--bootstrap` window (30 days by
+default), marking up to a month of history read in one go. Use `--from-now` if you'd
+rather start clean from the newest message, or `--bodies=false` for the fully non-invasive
+mode (see the caveat about that under "poll" below).
+
 If your school uses Suomi.fi strong identification for guardian login, password login
 will not work — Wilma's built-in "forward messages to email" setting plus your own mail
 client is the practical alternative in that case.
@@ -36,7 +42,7 @@ go build -o wilmabridge ./cmd/wilmabridge
 ```
 
 Requires Go 1.25+. `sync`, `extract` (stdin mode), `roles`, and `probe` use only the
-standard library. Persistence (`ingest`, `extract --db`, `review`, `db`) depends on
+standard library. Persistence (`ingest`, `extract --db`, `review`, `db`, `poll`) depends on
 [`modernc.org/sqlite`](https://pkg.go.dev/modernc.org/sqlite) — a pure-Go SQLite driver, no
 cgo, so cross-compiling and shipping a single static binary still works exactly as before
 (`CGO_ENABLED=0 go build ./...` is part of this project's own verification). Being pure Go
@@ -225,6 +231,88 @@ practice, not an edge case.
 `1.0` on the one live response where a schema bug caused it to silently drop data. All
 `needs_review` decisions come from the deterministic Go validators, never from this field.
 
+## `poll`: automatic incremental sync
+
+```sh
+export WILMA_DB=wilma.db
+
+# Cron-friendly: one pass, then exit. Put this on a schedule (e.g. */15 * * * *).
+wilmabridge poll
+
+# Or keep the process alive and let it poll itself:
+wilmabridge poll --interval 15m
+```
+
+`sync` is stateless and `ingest` only records what it was handed, so keeping a database in
+sync with Wilma otherwise means hand-rolling `sync --after $(wilmabridge db last-id --role
+!X) | wilmabridge ingest` yourself — and that breaks down with more than one child, since
+`sync --after` takes a single global ID floor while `db last-id` holds one per role. `poll`
+does this bookkeeping internally, per role, every time it runs:
+
+- **No recorded high-water mark for a role** (its first ever poll — including a newly added
+  child) — fetch messages from the last `--bootstrap` window (default `720h` / 30 days).
+  Nothing in Wilma supports filtering by date server-side, so this is done by scanning for
+  the oldest message whose timestamp falls inside the window and taking everything from
+  there up by ID (Wilma IDs increase monotonically with time, the same assumption `sync
+  --after` relies on).
+- **A recorded mark** — fetch only messages with a higher ID. Time never enters into it,
+  which is what makes this resumable: an interrupted pass (crash, network blip, a `SIGTERM`
+  from `--interval` mode) always picks back up exactly where it left off, never skipping a
+  gap. The mark advances after each message is safely stored, not once at the end of a role.
+- **A message's body fails to fetch** — that role stops there for this pass (the mark is
+  *not* advanced past it) rather than skipping it and continuing; skipping would either
+  permanently poison the message (an empty body is unextractable) or force it to be
+  re-listed and re-attempted forever. The next `poll` retries automatically. If one message
+  keeps failing and wedges a role, see `db set-last-id` below.
+
+### Flags
+
+| flag | default | meaning |
+|---|---|---|
+| `--host` | `$WILMA_HOST` | Wilma host |
+| `--db` | `$WILMA_DB` | SQLite database path (required) |
+| `--bootstrap` | `720h` | time window used only on a role's first ever poll (`0` disables the cutoff) |
+| `--from-now` | off | on a role's first ever poll, adopt the newest message id and fetch nothing — skip the bootstrap window entirely |
+| `--interval` | `0` | `0` = one pass then exit (the cron-friendly default); `>0` (minimum `1m`) keeps polling on that interval, re-logging in automatically if the session expires |
+| `--role` | all | restrict to one role prefix (repeatable) |
+| `--children` | `$WILMA_CHILDREN` | label map, same as `sync` |
+| `--bodies` | `true` | fetch full message bodies — **see the warning below if you turn this off** |
+| `--delay` | `300ms` | pause between HTTP requests |
+| `-v` | off | log HTTP requests plus per-role/per-message detail to stderr |
+
+> **`--bodies=false` warning.** Unlike `sync`, `poll` writes to a database that `extract`
+> later reads from. A message ingested without a body is stored `extract_state=skipped`
+> **and the high-water mark still advances past it** — so it becomes permanently invisible
+> to `extract`, not just delayed. If you use `--bodies=false` for a non-invasive poll, plan
+> to backfill bodies separately when you're ready to extract:
+> ```sh
+> wilmabridge sync --since 720h | wilmabridge ingest
+> ```
+
+`poll` only fetches and stores messages — it never runs extraction. Run `wilmabridge
+extract --db` separately (its own schedule, its own Gemini quota):
+
+```sh
+wilmabridge poll --db wilma.db
+wilmabridge extract --db wilma.db
+```
+
+A clean pass with nothing new prints nothing (cron-friendly — output should mean something
+happened). `-v` always prints a per-role and totals summary, useful as a heartbeat under
+`--interval`.
+
+### Limitations
+
+- Inbox only — there's no `--folder` flag, because the high-water mark is keyed by role
+  prefix alone and a second folder would need its own mark namespace. A message archived
+  out of the inbox between two passes is missed.
+- `--interval` shutdown (`Ctrl-C` / `SIGTERM`) waits for the current HTTP request to finish
+  before exiting (bounded by the client's 30s timeout) — it isn't instant.
+- `wilmabridge db set-last-id --db <path> --role <prefix> <id>` manually advances a role's
+  mark — the escape hatch for a role stuck behind one message that keeps failing to fetch.
+  It refuses to move a mark backward (same guarantee `poll` itself relies on), so it can't
+  be used to accidentally force a re-fetch of history.
+
 ## Persistence: `ingest`, `extract --db`, `review`, `db last-id`
 
 ```sh
@@ -260,8 +348,13 @@ to concern both.
   event itself doesn't carry a child — it belongs to the message, extracted once regardless
   of how many kids received it).
 - **`wilmabridge db last-id --db <path> [--role <prefix>]`** — prints the stored per-role
-  high-water mark, so a cron job can do `sync --after $(wilmabridge db last-id --role !X)`
-  without tracking that number anywhere else.
+  high-water mark and when that role was last polled. Historically the way to feed `sync
+  --after` for a cron job (`sync --after $(wilmabridge db last-id --role !X) | ingest`);
+  that bookkeeping is now handled internally by **`poll`** (see above), which is the
+  recommended way to keep a database in sync going forward. The manual `sync --after`
+  recipe still works for a one-off backfill.
+- **`wilmabridge db set-last-id --db <path> --role <prefix> <id>`** — manually advances a
+  role's high-water mark; see `poll`'s "Limitations" above for when you'd need this.
 
 Re-running `ingest` or `extract --db` over data that's already been processed is a safe
 no-op — verified live: a second `sync | ingest` pass over the same window reported
@@ -278,3 +371,9 @@ reminders/delivery are headed once those design questions (channel, timing) are 
 - `0` — success (including zero matching messages)
 - `1` — runtime failure (network, login, or a message that failed to list — check stderr)
 - `2` — usage/configuration error (missing `--host`/`$WILMA_HOST`, missing credentials)
+
+For `poll --interval`: a `Ctrl-C`/`SIGTERM` shutdown exits `0` even mid-pass — it was
+requested, not a crash. A single pass failing (a role error, a transient network issue)
+is logged and the loop continues to the next tick rather than exiting; only a setup
+failure (bad `--host`/`--db`/credentials) or five consecutive failed re-logins after a
+session expiry causes `--interval` mode itself to exit non-zero.

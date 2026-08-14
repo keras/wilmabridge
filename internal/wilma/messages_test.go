@@ -2,6 +2,7 @@ package wilma
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -140,5 +141,46 @@ func TestLoginListFetchRoundTrip(t *testing.T) {
 
 	if err := client.Logout(); err != nil {
 		t.Errorf("logout: %v", err)
+	}
+}
+
+// TestFetchMessage_LoginRedirectIsSessionExpired confirms that a session
+// that has expired between listing and fetching a message body — which
+// shows up only as a redirect to the login page, since the detail page has
+// no JSON error envelope to inspect — is reported as ErrSessionExpired
+// rather than the generic "could not find message body" error.
+func TestFetchMessage_LoginRedirectIsSessionExpired(t *testing.T) {
+	const loginHTML = `<!DOCTYPE html><html><body>
+<form action="/login" method="post">
+<input type="text" name="Login">
+<input type="password" name="Password">
+</form>
+</body></html>`
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/!111/messages/501", func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "/login", http.StatusFound)
+	})
+	mux.HandleFunc("/login", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(loginHTML))
+	})
+
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	host := strings.TrimPrefix(srv.URL, "http://")
+	client, err := NewClient(host, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client.baseURL.Scheme = "http"
+	client.baseURL.Host = host
+
+	_, err = client.FetchMessage("/!111", 501)
+	if err == nil {
+		t.Fatal("FetchMessage: want error, got nil")
+	}
+	if !errors.Is(err, ErrSessionExpired) {
+		t.Errorf("FetchMessage error = %v, want errors.Is(err, ErrSessionExpired)", err)
 	}
 }

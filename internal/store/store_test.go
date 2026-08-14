@@ -377,3 +377,74 @@ func TestHighWaterMark_MonotonicallyIncreases(t *testing.T) {
 		t.Errorf("AllHighWaterMarks()[%q] = %d, want 150", role, all[role])
 	}
 }
+
+func TestMarkPolled_DoesNotCreateAPhantomHighWaterMark(t *testing.T) {
+	s := openTestStore(t)
+	role := "/!04252751"
+
+	if err := s.MarkPolled(role); err != nil {
+		t.Fatalf("MarkPolled: %v", err)
+	}
+
+	// A role that has been polled but has never had a message ingested
+	// must still report ok=false -- see the poll_state comment in
+	// schema.go for why last_id=0 would otherwise wrongly look like a
+	// recorded mark and skip a role's bootstrap window entirely.
+	if _, ok, err := s.HighWaterMark(role); err != nil || ok {
+		t.Fatalf("HighWaterMark after MarkPolled only: ok=%v err=%v, want ok=false", ok, err)
+	}
+	all, err := s.AllHighWaterMarks()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, present := all[role]; present {
+		t.Errorf("AllHighWaterMarks should not include a role with no recorded mark, got %+v", all)
+	}
+
+	polledAt, ok, err := s.LastPolledAt(role)
+	if err != nil || !ok || polledAt.IsZero() {
+		t.Fatalf("LastPolledAt after MarkPolled: t=%v ok=%v err=%v, want a non-zero time and ok=true", polledAt, ok, err)
+	}
+}
+
+func TestMarkPolled_DoesNotDisturbAnExistingMark(t *testing.T) {
+	s := openTestStore(t)
+	role := "/!04252751"
+
+	if err := s.SetHighWaterMark(role, 100); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.MarkPolled(role); err != nil {
+		t.Fatalf("MarkPolled: %v", err)
+	}
+
+	id, ok, err := s.HighWaterMark(role)
+	if err != nil || !ok || id != 100 {
+		t.Fatalf("id=%d ok=%v err=%v, want 100/true unaffected by MarkPolled", id, ok, err)
+	}
+}
+
+func TestLastPolledAt_UnsetRoleReportsNotOK(t *testing.T) {
+	s := openTestStore(t)
+	if _, ok, err := s.LastPolledAt("/!never-polled"); err != nil || ok {
+		t.Fatalf("LastPolledAt for an unpolled role: ok=%v err=%v, want ok=false", ok, err)
+	}
+}
+
+func TestAllLastPolledAt(t *testing.T) {
+	s := openTestStore(t)
+	if err := s.MarkPolled("/!111"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.MarkPolled("/!222"); err != nil {
+		t.Fatal(err)
+	}
+
+	all, err := s.AllLastPolledAt()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(all) != 2 || all["/!111"].IsZero() || all["/!222"].IsZero() {
+		t.Errorf("AllLastPolledAt() = %+v, want two non-zero entries", all)
+	}
+}

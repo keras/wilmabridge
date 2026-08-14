@@ -470,3 +470,60 @@ func (s *Store) AllHighWaterMarks() (map[string]int64, error) {
 	}
 	return out, rows.Err()
 }
+
+// MarkPolled records that role was reached by a poll pass at the current
+// time, whether or not anything new was found. Deliberately independent of
+// sync_state/SetHighWaterMark — see the poll_state comment in schema.go for
+// why the two must not share a table.
+func (s *Store) MarkPolled(role string) error {
+	_, err := s.db.Exec(`
+		INSERT INTO poll_state (role, last_polled_at) VALUES (?, ?)
+		ON CONFLICT (role) DO UPDATE SET last_polled_at = excluded.last_polled_at`,
+		role, nowRFC3339(),
+	)
+	if err != nil {
+		return fmt.Errorf("store: recording poll time for %q: %w", role, err)
+	}
+	return nil
+}
+
+// LastPolledAt returns when role was last reached by a poll pass, or
+// ok=false if it never has been.
+func (s *Store) LastPolledAt(role string) (t time.Time, ok bool, err error) {
+	var raw string
+	err = s.db.QueryRow(`SELECT last_polled_at FROM poll_state WHERE role = ?`, role).Scan(&raw)
+	if errors.Is(err, sql.ErrNoRows) {
+		return time.Time{}, false, nil
+	}
+	if err != nil {
+		return time.Time{}, false, fmt.Errorf("store: reading poll time for %q: %w", role, err)
+	}
+	t, err = time.Parse(time.RFC3339, raw)
+	if err != nil {
+		return time.Time{}, false, fmt.Errorf("store: parsing poll time for %q: %w", role, err)
+	}
+	return t, true, nil
+}
+
+// AllLastPolledAt returns every role's stored last_polled_at.
+func (s *Store) AllLastPolledAt() (map[string]time.Time, error) {
+	rows, err := s.db.Query(`SELECT role, last_polled_at FROM poll_state ORDER BY role`)
+	if err != nil {
+		return nil, fmt.Errorf("store: querying poll_state: %w", err)
+	}
+	defer rows.Close()
+
+	out := map[string]time.Time{}
+	for rows.Next() {
+		var role, raw string
+		if err := rows.Scan(&role, &raw); err != nil {
+			return nil, fmt.Errorf("store: scanning poll_state: %w", err)
+		}
+		t, err := time.Parse(time.RFC3339, raw)
+		if err != nil {
+			return nil, fmt.Errorf("store: parsing poll time for %q: %w", role, err)
+		}
+		out[role] = t
+	}
+	return out, rows.Err()
+}

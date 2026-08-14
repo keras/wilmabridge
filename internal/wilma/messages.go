@@ -170,14 +170,34 @@ func extractRecipients(html string) []string {
 	return names
 }
 
+// loginPagePattern matches the login form Wilma renders when a session has
+// expired and a role-scoped GET gets redirected to /login instead of the
+// page that was asked for.
+var loginPagePattern = regexp.MustCompile(`(?i)<input[^>]+name="Password"`)
+
 // FetchMessage fetches the server-rendered detail page for one message and
 // scrapes its body and (when Wilma discloses them) recipients from it.
+//
+// Unlike GetJSON, this does not go through GetHTML: the message detail page
+// has no JSON error envelope to check, so an expired session here shows up
+// only as a redirect to /login. FetchMessage checks for that explicitly and
+// returns ErrSessionExpired so callers (notably an automatic poller) can
+// tell "session died" apart from "Wilma changed its page layout".
 func (c *Client) FetchMessage(prefix string, id int64) (*messageDetail, error) {
-	body, err := c.GetHTML(prefix, fmt.Sprintf("/messages/%d", id))
+	resp, err := c.get(prefix + fmt.Sprintf("/messages/%d", id))
+	if err != nil {
+		return nil, err
+	}
+	body, err := readBody(resp)
 	if err != nil {
 		return nil, err
 	}
 	html := string(body)
+
+	if resp.Request.URL.Path == "/login" || loginPagePattern.MatchString(html) {
+		return nil, fmt.Errorf("wilma: message %d: %w (redirected to login while fetching message)", id, ErrSessionExpired)
+	}
+
 	content, ok := extractContentHTML(html)
 	if !ok {
 		return nil, fmt.Errorf("wilma: message %d: could not find message body in response (session expired, or page layout changed?)", id)
