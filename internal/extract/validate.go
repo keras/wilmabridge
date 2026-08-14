@@ -102,6 +102,14 @@ func normalizeWeekdayClaim(claim string) (time.Weekday, bool) {
 	return wd, ok
 }
 
+// maxRecurrenceOccurrences caps how many Events one recurring Candidate can
+// expand into. Every real message seen so far tops out at 4 (see
+// testdata/README.md); this exists purely as a backstop against a
+// hallucinated or malformed count (e.g. the model returning 9999) flooding
+// the database with rows, not as a judgment about what's realistic —
+// generous on purpose.
+const maxRecurrenceOccurrences = 52 // a year of weekly occurrences
+
 // Source is the message-level context BuildEvent needs to resolve and
 // annotate a Candidate.
 type Source struct {
@@ -113,13 +121,73 @@ type Source struct {
 	SentAt         time.Time
 }
 
-// BuildEvent turns one model Candidate into a validated Event: date
-// resolution, the weekday cross-check, and the cheap plausibility flags.
-// It never drops a candidate for being suspicious — everything the model
-// returned is preserved, with NeedsReview/ReviewReasons set so a human (or
-// a future review queue) can see why.
-func BuildEvent(src Source, c Candidate) Event {
-	ev := Event{
+// stepDate returns the date of the n-th occurrence (n >= 0, n == 0 is base
+// itself) of a series starting at base, per freq — one of the values
+// schema.go's recurrence.freq enum allows. An unrecognized freq (shouldn't
+// happen; the schema enum should prevent the model from sending one) falls
+// back to weekly rather than returning base unchanged for every n, which
+// would silently collapse a whole series onto one date.
+func stepDate(base time.Time, freq string, n int) time.Time {
+	switch freq {
+	case "daily":
+		return base.AddDate(0, 0, n)
+	case "biweekly":
+		return base.AddDate(0, 0, 14*n)
+	case "monthly":
+		return base.AddDate(0, n, 0)
+	default: // "weekly", or anything unrecognized
+		return base.AddDate(0, 0, 7*n)
+	}
+}
+
+// applyDateChecks runs the weekday cross-check and the cheap plausibility
+// flags (weekend, far-future) against one occurrence's resolved date. Used
+// once for a non-recurring candidate and once per occurrence for a
+// recurring one — each occurrence is checked independently against its own
+// actual weekday, since e.g. a monthly series can land on a different
+// weekday each time even though weekly/biweekly always preserve it.
+func applyDateChecks(ev *Event, sentAt time.Time, weekdayClaim string, resolved time.Time) {
+	flag := func(reason string) {
+		ev.NeedsReview = true
+		ev.ReviewReasons = append(ev.ReviewReasons, reason)
+	}
+
+	if weekdayClaim != "" {
+		claimed, claimOK := normalizeWeekdayClaim(weekdayClaim)
+		if !claimOK {
+			flag(fmt.Sprintf("unrecognized weekday_claim %q", weekdayClaim))
+		} else {
+			match := claimed == resolved.Weekday()
+			ev.WeekdayOK = &match
+			if !match {
+				flag(fmt.Sprintf(
+					"message says %s %s, but %s is a %s — likely a typo in the source message; verify which is correct",
+					weekdayClaim, ev.DateRaw, ev.ResolvedDate, finnishWeekdayName[resolved.Weekday()],
+				))
+			}
+		}
+	}
+
+	if wd := resolved.Weekday(); wd == time.Saturday || wd == time.Sunday {
+		flag(fmt.Sprintf("%s falls on a weekend (%s)", ev.ResolvedDate, finnishWeekdayName[wd]))
+	}
+
+	if !sentAt.IsZero() && resolved.Sub(sentAt) > farFutureThreshold {
+		flag("resolved date is more than ~9 months after the message was sent — check this isn't a retrospective mention")
+	}
+}
+
+// BuildEvent turns one model Candidate into one or more validated Events.
+// Ordinarily that's one Event. A recurring candidate (Recurrence present
+// and valid) becomes one Event PER OCCURRENCE — dated by stepping forward
+// from the first occurrence per Recurrence.Freq — each independently date-
+// resolved, weekday-checked, and flagged; there is no series/grouping
+// field linking them back together, by design. It never drops a candidate
+// for being suspicious — everything the model returned is preserved, with
+// NeedsReview/ReviewReasons set on the relevant event(s) so a human (or a
+// future review queue) can see why.
+func BuildEvent(src Source, c Candidate) []Event {
+	base := Event{
 		WilmaID:         src.WilmaID,
 		Child:           src.Child,
 		Role:            src.Role,
@@ -131,59 +199,83 @@ func BuildEvent(src Source, c Candidate) Event {
 		DateRaw:         c.Date,
 		WeekdayClaim:    c.WeekdayClaim,
 		Time:            c.Time,
-		Location:        c.Location,
-		Items:           c.Items,
 		Link:            c.Link,
-		Recurrence:      c.Recurrence,
 		ModelConfidence: c.Confidence,
 		Quote:           c.Quote,
 		ExtractVer:      ExtractVer,
 	}
 
-	flag := func(reason string) {
-		ev.NeedsReview = true
-		ev.ReviewReasons = append(ev.ReviewReasons, reason)
+	switch strings.ToLower(strings.TrimSpace(c.Audience)) {
+	case AudienceChild:
+		base.Audience = AudienceChild
+	case AudienceGuardians:
+		base.Audience = AudienceGuardians
+	default:
+		// Same never-silently-guess philosophy as the date/weekday
+		// validators below. "child" is the conservative default — it's the
+		// pre-audience behavior (fan out to everyone who received the
+		// message), and over-notifying beats under-notifying — but the
+		// guess is made visible rather than hidden. Applied to base so
+		// every occurrence of a recurring candidate carries it.
+		base.Audience = AudienceChild
+		base.NeedsReview = true
+		base.ReviewReasons = append(base.ReviewReasons, fmt.Sprintf("audience missing or unrecognized (%q), defaulting to child", c.Audience))
 	}
 
 	day, month, ok := parseDateRaw(c.Date)
 	if !ok {
-		flag(fmt.Sprintf("could not parse date %q", c.Date))
-	} else {
-		resolved, valid := resolveDate(src.SentAt, day, month)
-		if !valid {
-			flag(fmt.Sprintf("%q is not a real calendar date", c.Date))
-		} else {
-			ev.ResolvedDate = resolved.Format("2006-01-02")
+		ev := base
+		ev.NeedsReview = true
+		ev.ReviewReasons = append(ev.ReviewReasons, fmt.Sprintf("could not parse date %q", c.Date))
+		return []Event{ev}
+	}
 
-			if c.WeekdayClaim != "" {
-				claimed, claimOK := normalizeWeekdayClaim(c.WeekdayClaim)
-				if !claimOK {
-					flag(fmt.Sprintf("unrecognized weekday_claim %q", c.WeekdayClaim))
-				} else {
-					match := claimed == resolved.Weekday()
-					ev.WeekdayOK = &match
-					if !match {
-						flag(fmt.Sprintf(
-							"message says %s %s, but %s is a %s — likely a typo in the source message; verify which is correct",
-							c.WeekdayClaim, c.Date, ev.ResolvedDate, finnishWeekdayName[resolved.Weekday()],
-						))
-					}
-				}
-			}
+	firstOccurrence, valid := resolveDate(src.SentAt, day, month)
+	if !valid {
+		ev := base
+		ev.NeedsReview = true
+		ev.ReviewReasons = append(ev.ReviewReasons, fmt.Sprintf("%q is not a real calendar date", c.Date))
+		return []Event{ev}
+	}
 
-			if wd := resolved.Weekday(); wd == time.Saturday || wd == time.Sunday {
-				flag(fmt.Sprintf("%s falls on a weekend (%s)", ev.ResolvedDate, finnishWeekdayName[wd]))
-			}
+	if c.Recurrence == nil {
+		ev := base
+		ev.ResolvedDate = firstOccurrence.Format("2006-01-02")
+		applyDateChecks(&ev, src.SentAt, c.WeekdayClaim, firstOccurrence)
+		return []Event{ev}
+	}
 
-			if !src.SentAt.IsZero() && resolved.Sub(src.SentAt) > farFutureThreshold {
-				flag("resolved date is more than ~9 months after the message was sent — check this isn't a retrospective mention")
-			}
+	if c.Recurrence.Freq == "" || c.Recurrence.Count == 0 {
+		ev := base
+		ev.ResolvedDate = firstOccurrence.Format("2006-01-02")
+		applyDateChecks(&ev, src.SentAt, c.WeekdayClaim, firstOccurrence)
+		ev.NeedsReview = true
+		ev.ReviewReasons = append(ev.ReviewReasons, "recurrence present but missing freq/count")
+		return []Event{ev}
+	}
+
+	count := c.Recurrence.Count
+	truncated := count > maxRecurrenceOccurrences
+	if truncated {
+		count = maxRecurrenceOccurrences
+	}
+
+	events := make([]Event, 0, count)
+	for i := 0; i < count; i++ {
+		occurrence := firstOccurrence
+		if i > 0 {
+			occurrence = stepDate(firstOccurrence, c.Recurrence.Freq, i)
 		}
+		ev := base
+		ev.ResolvedDate = occurrence.Format("2006-01-02")
+		applyDateChecks(&ev, src.SentAt, c.WeekdayClaim, occurrence)
+		if truncated {
+			ev.NeedsReview = true
+			ev.ReviewReasons = append(ev.ReviewReasons, fmt.Sprintf(
+				"recurrence count %d exceeds the %d-occurrence cap; only %d emitted", c.Recurrence.Count, maxRecurrenceOccurrences, maxRecurrenceOccurrences,
+			))
+		}
+		events = append(events, ev)
 	}
-
-	if c.Recurrence != nil && (c.Recurrence.Freq == "" || c.Recurrence.Count == 0) {
-		flag("recurrence present but missing freq/count")
-	}
-
-	return ev
+	return events
 }

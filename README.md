@@ -5,9 +5,10 @@ guardian account, prints messages for your children as
 [NDJSON](https://github.com/ndjson/ndjson-spec), and can extract the actionable dated
 events buried in them ("koe torstaina 5.3.") using a Gemini model. Fetching (`sync`) and
 extraction (`extract`) are stateless pipe stages by default — but `extract` and the
-`ingest`/`review`/`db`/`poll` commands can optionally persist into a local SQLite file, so
-the same Wilma message landing in both kids' inboxes gets deduplicated and extracted once,
-and nothing needs to be re-processed on every run. See "Persistence" and "poll" below.
+`ingest`/`review`/`db`/`poll`/`reextract` commands can optionally persist into a local
+SQLite file, so the same Wilma message landing in both kids' inboxes gets deduplicated and
+extracted once, and nothing needs to be re-processed on every run. See "Persistence" and
+"poll" below.
 
 **Unofficial.** Wilma has no public API for guardians. This talks to the same endpoints
 Wilma's own web client uses, reverse-engineered by observing that client (see also the
@@ -132,10 +133,15 @@ wilmabridge sync --since 168h | wilmabridge extract > events.ndjson
 (Google AI Studio) to pull out actionable dated events — "koe torstaina 5.3.", "vastausaikaa
 14.4. asti" — as structured candidates. Go then resolves each candidate's bare date
 (`"4.3."`, no year) against the message's send date, and cross-checks any weekday the
-message wrote against the resolved calendar date. **It never expands a recurring event
-("neljänä perättäisenä viikkona") into multiple dated occurrences** — that's out of scope
-for this stage; the recurrence hint is preserved on the output record but only one event is
-emitted per candidate.
+message wrote against the resolved calendar date. **A recurring event ("neljänä
+perättäisenä viikkona") is expanded into one output record per occurrence** — the model
+still returns one candidate with a `{freq,count}` hint, but Go turns that into N
+independent dated records (stepping by the frequency from the first occurrence), each with
+its own resolved date and its own review flags. There's no field linking them back into a
+series; a weekly swim class becomes 4 plain events, not 1 event plus a recurrence blob.
+Location and packing-list-style details are not their own fields either — the model is
+asked to fold that prose into `detail` (or it's already sitting in the verbatim `quote`)
+instead of parsing it into structured `location`/`items` fields.
 
 With no `--db` flag, this is a pure stdin→stdout transform, no file written anywhere — the
 mode this was originally built and tuned in, and still the right one for quick iteration on
@@ -168,6 +174,8 @@ drift into the free tier by default. (Confirmed live: this project hit the free 
 | `--db` | `$WILMA_DB` | SQLite path; enables persistent pending-queue mode instead of stdin (see "Persistence") |
 | `--limit` | `20` | max pending messages to process this run (`--db` mode only) |
 | `--max-attempts` | `5` | mark a message `failed` (stop retrying) after this many failed *runs*, not HTTP retries (`--db` mode only) |
+| `--interval` | `0` | `0` = one pass then exit; `>0` (minimum `1m`) keeps draining the pending queue on that interval instead, the same idea as `poll --interval` (`--db` mode only) |
+| `--note` | `""` | free text recorded on this pass's run row (default: `"pending queue"`); see "reextract" below for what a run is |
 | `-v` | off | log the full prompt, latency, token usage, and raw model output to stderr — see below |
 
 Messages with empty `body_text` (i.e. fetched via `sync --bodies=false`) are skipped with
@@ -213,7 +221,7 @@ One JSON object per **event** (not per message — one message can yield several
  "quote":"Lauantai 30.5.\n\nLukuvuoden päättäjäiset kello 9.00 alkaen.",
  "resolved_date":"2026-05-30","weekday_ok":true,
  "needs_review":true,"review_reasons":["2026-05-30 falls on a weekend (lauantai)"],
- "extract_ver":1}
+ "audience":"child","extract_ver":3}
 ```
 
 That's an actual event from a live run — end-of-year ceremony genuinely falls on a
@@ -227,9 +235,76 @@ test cases — date ranges (`"1.-7.4"`), ISO week numbers (`"viikolla 20"`), bar
 up as `needs_review` rather than a wrong or crashed result. Expect a real review queue in
 practice, not an edge case.
 
+A recurring candidate's occurrences share everything above except `resolved_date` (and
+`weekday_ok`/`needs_review`/`review_reasons`, each computed independently per occurrence —
+e.g. a monthly series can be weekday-consistent on one occurrence and not on the next, even
+though the model only gave one `weekday_claim` for the whole series). `date_raw` stays the
+same literal phrase on every occurrence — it's what the message actually said; only
+`resolved_date` differs. There's no `series_id` or `occurrence` field: four occurrences of
+one swim class are four unrelated-looking rows that happen to share a title and quote, by
+design — see `internal/extract/validate.go`'s `BuildEvent` doc comment.
+
 `model_confidence` is the model's self-reported score — **do not trust it**; it reported
 `1.0` on the one live response where a schema bug caused it to silently drop data. All
 `needs_review` decisions come from the deterministic Go validators, never from this field.
+
+`audience` (added in `extract_ver` 2) is `"child"` (concerns the student — most events) or
+`"guardians"` (concerns only the parents, e.g. a vanhempainilta/parents'-evening notice, not
+the student). The model is deliberately never told which children received a message — see
+"the child association comes from Wilma metadata, never from the model" below — it only
+classifies who an event is *for*; in `--db` mode that classification is what decides the
+`children` list `wilmabridge review` prints (see "Persistence" below). If the model omits or
+sends an unrecognized value, `audience` defaults to `"child"` (the safe, pre-audience
+behavior) and the event is flagged `needs_review` rather than silently guessed — same
+philosophy as an unparseable date. **This field is newer and less validated than the rest of
+the schema**: it was added on top of the (thoroughly live-tested) date/weekday/recurrence
+logic without a live capture of a real guardians-only message yet — see
+`internal/extract/testdata/README.md` for exactly what is and isn't verified.
+
+## `reextract`: re-running extraction
+
+```sh
+# See what would be redone, at no cost -- no Gemini calls, nothing written.
+wilmabridge reextract --db wilma.db --dry-run
+
+# Catch messages up to the current prompt/schema version (extract_ver).
+wilmabridge reextract --db wilma.db --limit 50
+
+# Redo specific messages with a stronger model, even if already current.
+wilmabridge reextract --db wilma.db --force --model gemini-3.5-pro --id 19790210
+```
+
+Every extraction pass — the everyday `extract --db` pending-queue drain and an explicit
+`reextract` alike — is one **run**, recorded in the database (table `extraction_runs`).
+**Latest run wins, and that's derived, not stored**: there is no "current"/"superseded" flag
+anywhere. Re-extracting a message never deletes or edits its previous events — they just sit
+there, older — and which events are "current" for a message is worked out at read time from
+the highest-numbered run that covered it. `wilmabridge db runs` lists run history; `sqlite3
+wilma.db` can always see every generation of every message's events if you need to compare.
+
+By default `reextract` selects messages that are `done` or `failed` **and** whose stored
+`extract_ver` is behind the binary's current one (a `failed` message with no `extract_ver` at
+all always counts as behind) — so bumping the prompt/schema (as the `audience` field did,
+ver 1 → 2) makes your whole history eligible with zero extra bookkeeping. `--force` ignores
+version entirely, for redoing already-current messages with a different model. `extract --db`
+(the pending queue) is untouched by any of this — the two commands never select the same
+messages, so running both never double-extracts anything.
+
+### Flags
+
+| flag | default | meaning |
+|---|---|---|
+| `--db` | `$WILMA_DB` | required |
+| `--api-key-env`, `--model`, `--base-url`, `--delay`, `--max-retries`, `--max-attempts`, `-v` | same as `extract` | |
+| `--limit` | `20` | deliberately not unlimited — a re-run costs real money |
+| `--force` | off | ignore `extract_ver`; redo even messages already at the current version |
+| `--since` | `0` | only messages sent within this duration before now (`0` = no lower bound) |
+| `--id` | — | restrict to one `wilma_id`; repeatable |
+| `--note` | auto-generated | free text recorded on this run's row |
+| `--dry-run` | off | print the selected messages (id, sent-at, subject) and exit — no Gemini calls, no run created |
+
+`--dry-run` matters here specifically: a re-run against a paid or stronger model is exactly
+the kind of thing worth previewing before it costs money.
 
 ## `poll`: automatic incremental sync
 
@@ -343,10 +418,14 @@ to concern both.
   until `--max-attempts` failed *runs* have accumulated, then marked `failed` and left alone
   — the retry budget is finite, not infinite. **Events still print to stdout in this mode
   too**, so `-v` and piping keep working exactly as in stdin mode.
-- **`wilmabridge review --db <path>`** — NDJSON of every event flagged `needs_review`,
-  annotated with which children it concerns (joined through `message_children`, since an
-  event itself doesn't carry a child — it belongs to the message, extracted once regardless
-  of how many kids received it).
+- **`wilmabridge review --db <path>`** — NDJSON of every **current** event (see "reextract"
+  above for what makes an event current) flagged `needs_review`, annotated with which
+  children it concerns. The child association comes from Wilma metadata, never from the
+  model: extraction runs once per message regardless of how many kids received it, and each
+  event's `audience` classification (see `extract`'s output record above) decides whether
+  that fans out to every child linked to the message (`"child"`) or to none at all
+  (`"guardians"`) — `children` is always present, `[]` rather than omitted when it's empty,
+  so "deliberately zero" is never confused with "not computed".
 - **`wilmabridge db last-id --db <path> [--role <prefix>]`** — prints the stored per-role
   high-water mark and when that role was last polled. Historically the way to feed `sync
   --after` for a cron job (`sync --after $(wilmabridge db last-id --role !X) | ingest`);
@@ -355,6 +434,9 @@ to concern both.
   recipe still works for a one-off backfill.
 - **`wilmabridge db set-last-id --db <path> --role <prefix> <id>`** — manually advances a
   role's high-water mark; see `poll`'s "Limitations" above for when you'd need this.
+- **`wilmabridge db runs --db <path> [--limit N]`** — NDJSON of extraction run history,
+  newest first (model, `extract_ver`, when it started/finished, how many messages/events it
+  produced) — see "reextract" above.
 
 Re-running `ingest` or `extract --db` over data that's already been processed is a safe
 no-op — verified live: a second `sync | ingest` pass over the same window reported
@@ -377,3 +459,10 @@ requested, not a crash. A single pass failing (a role error, a transient network
 is logged and the loop continues to the next tick rather than exiting; only a setup
 failure (bad `--host`/`--db`/credentials) or five consecutive failed re-logins after a
 session expiry causes `--interval` mode itself to exit non-zero.
+
+For `extract --interval`: same shutdown behavior (`0` on signal, even mid-pass — an
+in-flight Gemini call is not counted as a failed attempt when cancelled this way, so it
+doesn't burn a retry). A pass that fails outright is logged and the loop waits for the next
+tick; three *consecutive* per-message failures within one pass (a dead API key, a Gemini
+outage) abort just that pass early rather than spending every remaining message's retry
+budget on a cause that has nothing to do with the messages themselves.

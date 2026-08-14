@@ -1,9 +1,12 @@
 package store
 
 import (
+	"database/sql"
+	"encoding/json"
 	"errors"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -35,6 +38,16 @@ func testMsg(id int64, child, role, subject, body string, sentAt time.Time) wilm
 	}
 }
 
+// testRun starts a run for tests that don't care about its particulars.
+func testRun(t *testing.T, s *Store) int64 {
+	t.Helper()
+	id, err := s.StartRun("test-model", 1, "test")
+	if err != nil {
+		t.Fatalf("StartRun: %v", err)
+	}
+	return id
+}
+
 func TestOpen_MigrationIsIdempotent(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "wilma.db")
 	s1, err := Open(path)
@@ -48,6 +61,209 @@ func TestOpen_MigrationIsIdempotent(t *testing.T) {
 		t.Fatalf("second Open (re-migrate existing db): %v", err)
 	}
 	s2.Close()
+}
+
+// legacySchemaSQL is schemaSQL as it existed before extraction_runs,
+// run_messages, event_children, and events/extractions.run_id and
+// events.audience were added — i.e. exactly what a real pre-existing
+// wilmabridge database looks like. Kept as a literal copy (not derived from
+// the current schema.go) so this test actually exercises the ALTER TABLE /
+// backfill path in migrate() rather than a no-op CREATE TABLE IF NOT EXISTS.
+const legacySchemaSQL = `
+CREATE TABLE IF NOT EXISTS messages (
+  wilma_id      INTEGER NOT NULL,
+  content_hash  TEXT    NOT NULL,
+  subject       TEXT    NOT NULL,
+  sender        TEXT,
+  sender_id     INTEGER,
+  folder        TEXT,
+  sent_at       TEXT,
+  sent_at_raw   TEXT    NOT NULL,
+  body_text     TEXT,
+  body_html     TEXT,
+  url           TEXT    NOT NULL,
+  fetched_at    TEXT    NOT NULL,
+  extract_state TEXT    NOT NULL DEFAULT 'pending',
+  extract_ver   INTEGER,
+  attempts      INTEGER NOT NULL DEFAULT 0,
+  last_error    TEXT,
+  PRIMARY KEY (wilma_id, content_hash)
+);
+
+CREATE INDEX IF NOT EXISTS idx_messages_extract_state ON messages (extract_state);
+
+CREATE TABLE IF NOT EXISTS message_children (
+  wilma_id     INTEGER NOT NULL,
+  content_hash TEXT    NOT NULL,
+  child        TEXT    NOT NULL,
+  role_prefix  TEXT    NOT NULL,
+  was_unread   INTEGER NOT NULL,
+  PRIMARY KEY (wilma_id, content_hash, role_prefix),
+  FOREIGN KEY (wilma_id, content_hash) REFERENCES messages (wilma_id, content_hash)
+);
+
+CREATE TABLE IF NOT EXISTS events (
+  id               INTEGER PRIMARY KEY,
+  wilma_id         INTEGER NOT NULL,
+  content_hash     TEXT    NOT NULL,
+  kind             TEXT    NOT NULL,
+  title            TEXT    NOT NULL,
+  detail           TEXT,
+  date_raw         TEXT    NOT NULL,
+  weekday_claim    TEXT,
+  time             TEXT,
+  location         TEXT,
+  items            TEXT,
+  link             TEXT,
+  recurrence       TEXT,
+  model_confidence REAL,
+  quote            TEXT    NOT NULL,
+  resolved_date    TEXT,
+  weekday_ok       INTEGER,
+  needs_review     INTEGER NOT NULL DEFAULT 0,
+  review_reasons   TEXT,
+  extract_ver      INTEGER NOT NULL,
+  created_at       TEXT    NOT NULL,
+  FOREIGN KEY (wilma_id, content_hash) REFERENCES messages (wilma_id, content_hash)
+);
+
+CREATE INDEX IF NOT EXISTS idx_events_needs_review ON events (needs_review);
+CREATE INDEX IF NOT EXISTS idx_events_message ON events (wilma_id, content_hash);
+
+CREATE TABLE IF NOT EXISTS extractions (
+  id            INTEGER PRIMARY KEY,
+  wilma_id      INTEGER NOT NULL,
+  content_hash  TEXT    NOT NULL,
+  model         TEXT    NOT NULL,
+  request       TEXT    NOT NULL,
+  response      TEXT,
+  status_code   INTEGER,
+  http_attempts INTEGER,
+  error         TEXT,
+  created_at    TEXT    NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS sync_state (
+  role       TEXT PRIMARY KEY,
+  last_id    INTEGER NOT NULL,
+  updated_at TEXT    NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS poll_state (
+  role           TEXT PRIMARY KEY,
+  last_polled_at TEXT NOT NULL
+);
+`
+
+// TestOpen_MigratesLegacyDatabase builds a database on the pre-run-tracking
+// schema, seeds it exactly the way real pre-existing data would look
+// (a message, two children, a needs_review event, an extraction audit
+// row), then Opens it with today's code and checks the migration backfill
+// reproduces the old implicit behavior: one synthetic run, everything
+// attached to it, audience defaulted to "child", and NeedsReview()'s output
+// unchanged in shape from before the migration.
+func TestOpen_MigratesLegacyDatabase(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "wilma.db")
+
+	raw, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("opening raw legacy db: %v", err)
+	}
+	if _, err := raw.Exec(legacySchemaSQL); err != nil {
+		t.Fatalf("creating legacy schema: %v", err)
+	}
+	sentAt := time.Date(2026, 8, 12, 8, 37, 0, 0, time.UTC)
+	if _, err := raw.Exec(`
+		INSERT INTO messages (wilma_id, content_hash, subject, sent_at, sent_at_raw, body_text, url, fetched_at, extract_state, extract_ver)
+		VALUES (1, 'h1', 'Retki', ?, ?, 'body', 'https://x/1', ?, 'done', 1)`,
+		sentAt.Format(time.RFC3339), sentAt.Format("2006-01-02 15:04"), sentAt.Format(time.RFC3339),
+	); err != nil {
+		t.Fatalf("seeding legacy message: %v", err)
+	}
+	for i, child := range []string{"Ella", "Jooa"} {
+		if _, err := raw.Exec(`
+			INSERT INTO message_children (wilma_id, content_hash, child, role_prefix, was_unread) VALUES (1, 'h1', ?, ?, 0)`,
+			child, "/!"+strconv.Itoa(i+1),
+		); err != nil {
+			t.Fatalf("seeding legacy message_children: %v", err)
+		}
+	}
+	if _, err := raw.Exec(`
+		INSERT INTO events (wilma_id, content_hash, kind, title, date_raw, quote, needs_review, review_reasons, extract_ver, created_at)
+		VALUES (1, 'h1', 'event', 'Retkipäivä', '9.5.', 'q', 1, '["weekend"]', 1, ?)`,
+		sentAt.Format(time.RFC3339),
+	); err != nil {
+		t.Fatalf("seeding legacy event: %v", err)
+	}
+	if _, err := raw.Exec(`
+		INSERT INTO extractions (wilma_id, content_hash, model, request, created_at) VALUES (1, 'h1', 'old-model', '{}', ?)`,
+		sentAt.Format(time.RFC3339),
+	); err != nil {
+		t.Fatalf("seeding legacy extraction: %v", err)
+	}
+	raw.Close()
+
+	s, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open (migrate legacy db): %v", err)
+	}
+	defer s.Close()
+
+	var runCount int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM extraction_runs`).Scan(&runCount); err != nil {
+		t.Fatal(err)
+	}
+	if runCount != 1 {
+		t.Errorf("extraction_runs count = %d, want 1 (the backfill run)", runCount)
+	}
+
+	var orphanEvents, orphanExtractions int
+	s.db.QueryRow(`SELECT COUNT(*) FROM events WHERE run_id IS NULL`).Scan(&orphanEvents)
+	s.db.QueryRow(`SELECT COUNT(*) FROM extractions WHERE run_id IS NULL`).Scan(&orphanExtractions)
+	if orphanEvents != 0 || orphanExtractions != 0 {
+		t.Errorf("orphaned rows after migration: events=%d extractions=%d, want 0/0", orphanEvents, orphanExtractions)
+	}
+
+	var audience string
+	if err := s.db.QueryRow(`SELECT audience FROM events WHERE wilma_id = 1`).Scan(&audience); err != nil {
+		t.Fatal(err)
+	}
+	if audience != "child" {
+		t.Errorf("legacy event audience = %q, want %q", audience, "child")
+	}
+
+	var coverage int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM run_messages WHERE wilma_id = 1`).Scan(&coverage); err != nil {
+		t.Fatal(err)
+	}
+	if coverage != 1 {
+		t.Errorf("run_messages coverage rows for message 1 = %d, want 1", coverage)
+	}
+
+	rows, err := s.NeedsReview()
+	if err != nil {
+		t.Fatalf("NeedsReview after migration: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("NeedsReview after migration = %d rows, want 1", len(rows))
+	}
+	if len(rows[0].Children) != 2 {
+		t.Errorf("migrated event's children = %v, want both Ella and Jooa (matching the old blanket message_children join)", rows[0].Children)
+	}
+
+	// Idempotency: opening the now-migrated db again must not create a
+	// second backfill run or duplicate any data.
+	s.Close()
+	s2, err := Open(path)
+	if err != nil {
+		t.Fatalf("second Open: %v", err)
+	}
+	defer s2.Close()
+	var runCount2 int
+	s2.db.QueryRow(`SELECT COUNT(*) FROM extraction_runs`).Scan(&runCount2)
+	if runCount2 != 1 {
+		t.Errorf("extraction_runs count after second Open = %d, want still 1", runCount2)
+	}
 }
 
 func TestIngestMessage_DedupAcrossChildren(t *testing.T) {
@@ -175,8 +391,12 @@ func TestSaveEvents_RoundTripsAllFieldTypes(t *testing.T) {
 	weekdayOKFalse := false
 	events := []extract.Event{
 		{
+			// Note this represents ONE occurrence of what would have been a
+			// recurring candidate before extraction -- BuildEvent (tested
+			// separately in internal/extract) is what expands a Candidate's
+			// Recurrence into several of these; SaveEvents just persists
+			// whatever Event slice it's handed, one at a time.
 			WilmaID: 42, Kind: "event", Title: "Uinti", DateRaw: "10.10.", WeekdayClaim: "la",
-			Items: []string{"uimahousut", "pyyhe"}, Recurrence: &extract.Recurrence{Freq: "weekly", Count: 4},
 			ResolvedDate: "2026-10-10", WeekdayOK: &weekdayOKTrue, NeedsReview: true,
 			ReviewReasons: []string{"2026-10-10 falls on a weekend (lauantai)"},
 			Quote:         "quote1", ExtractVer: 1,
@@ -194,7 +414,8 @@ func TestSaveEvents_RoundTripsAllFieldTypes(t *testing.T) {
 		},
 	}
 
-	if err := s.SaveEvents(42, hash, events); err != nil {
+	runID := testRun(t, s)
+	if err := s.SaveEvents(runID, 42, hash, events); err != nil {
 		t.Fatalf("SaveEvents: %v", err)
 	}
 	if err := s.MarkExtractDone(42, hash, 1); err != nil {
@@ -218,12 +439,6 @@ func TestSaveEvents_RoundTripsAllFieldTypes(t *testing.T) {
 	if !ok {
 		t.Fatal("missing Uinti event")
 	}
-	if len(uinti.Items) != 2 || uinti.Items[0] != "uimahousut" {
-		t.Errorf("items = %v", uinti.Items)
-	}
-	if uinti.Recurrence == nil || uinti.Recurrence.Freq != "weekly" || uinti.Recurrence.Count != 4 {
-		t.Errorf("recurrence = %+v", uinti.Recurrence)
-	}
 	if uinti.WeekdayOK == nil || !*uinti.WeekdayOK {
 		t.Errorf("weekday_ok = %v, want true", uinti.WeekdayOK)
 	}
@@ -244,9 +459,6 @@ func TestSaveEvents_RoundTripsAllFieldTypes(t *testing.T) {
 	if fyi.WeekdayOK != nil {
 		t.Errorf("weekday_ok should be nil when there was nothing to check, got %v", *fyi.WeekdayOK)
 	}
-	if fyi.Recurrence != nil {
-		t.Errorf("recurrence should be nil, got %+v", fyi.Recurrence)
-	}
 
 	// The exam (NeedsReview=false) must not appear in the review queue at all.
 	if _, present := byTitle["Koe"]; present {
@@ -260,6 +472,342 @@ func TestSaveEvents_RoundTripsAllFieldTypes(t *testing.T) {
 	}
 	if state != "done" || ver != 1 {
 		t.Errorf("state=%q ver=%d, want done/1", state, ver)
+	}
+}
+
+func TestStartRun_FinishRun(t *testing.T) {
+	s := openTestStore(t)
+
+	runID, err := s.StartRun("gemini-3.5-flash-lite", 2, "pending queue")
+	if err != nil {
+		t.Fatalf("StartRun: %v", err)
+	}
+
+	runs, err := s.Runs(10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(runs) != 1 {
+		t.Fatalf("Runs() = %d, want 1", len(runs))
+	}
+	if runs[0].ID != runID || runs[0].Model != "gemini-3.5-flash-lite" || runs[0].ExtractVer != 2 {
+		t.Errorf("run = %+v", runs[0])
+	}
+	if !runs[0].FinishedAt.IsZero() {
+		t.Error("FinishedAt should be zero before FinishRun")
+	}
+
+	if err := s.FinishRun(runID); err != nil {
+		t.Fatalf("FinishRun: %v", err)
+	}
+	runs, err = s.Runs(10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if runs[0].FinishedAt.IsZero() {
+		t.Error("FinishedAt should be set after FinishRun")
+	}
+}
+
+func TestRun_MarshalJSONOmitsZeroFinishedAt(t *testing.T) {
+	r := Run{ID: 1, Model: "m", ExtractVer: 1, StartedAt: time.Date(2026, 8, 14, 0, 0, 0, 0, time.UTC)}
+	b, err := json.Marshal(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(b), `"finished_at"`) {
+		t.Errorf("expected finished_at to be omitted for a zero time (struct-typed omitempty is a no-op in encoding/json), got: %s", b)
+	}
+
+	r.FinishedAt = time.Date(2026, 8, 14, 1, 0, 0, 0, time.UTC)
+	b, err = json.Marshal(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(b), `"finished_at":"2026-08-14T01:00:00Z"`) {
+		t.Errorf("expected finished_at to be present once set, got: %s", b)
+	}
+}
+
+func TestSaveEvents_AudienceChildFansOutToAllChildren(t *testing.T) {
+	s := openTestStore(t)
+	sentAt := time.Date(2026, 8, 12, 8, 37, 0, 0, time.UTC)
+	msgA := testMsg(1, "Ella", "/!1", "Koko koulun tiedote", "body", sentAt)
+	msgB := testMsg(1, "Jooa", "/!2", "Koko koulun tiedote", "body", sentAt)
+	if _, err := s.IngestMessage(msgA); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.IngestMessage(msgB); err != nil {
+		t.Fatal(err)
+	}
+	hash := contentHash(msgA.Subject, msgA.SentAtRaw, msgA.BodyHTML)
+
+	runID := testRun(t, s)
+	events := []extract.Event{{WilmaID: 1, Kind: "event", Title: "Retki", DateRaw: "9.5.", Quote: "q", Audience: extract.AudienceChild, ExtractVer: 2}}
+	if err := s.SaveEvents(runID, 1, hash, events); err != nil {
+		t.Fatalf("SaveEvents: %v", err)
+	}
+
+	rows, err := s.LatestEvents(EventFilter{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("LatestEvents = %d rows, want 1", len(rows))
+	}
+	if len(rows[0].Children) != 2 {
+		t.Errorf("children = %v, want both Ella and Jooa (whole-school fan-out)", rows[0].Children)
+	}
+}
+
+func TestSaveEvents_AudienceGuardiansHasNoChildren(t *testing.T) {
+	s := openTestStore(t)
+	msg := testMsg(1, "Ella", "/!1", "Vanhempainilta", "body", time.Now())
+	if _, err := s.IngestMessage(msg); err != nil {
+		t.Fatal(err)
+	}
+	hash := contentHash(msg.Subject, msg.SentAtRaw, msg.BodyHTML)
+
+	runID := testRun(t, s)
+	events := []extract.Event{{WilmaID: 1, Kind: "event", Title: "Vanhempainilta", DateRaw: "26.8.", Quote: "q", Audience: extract.AudienceGuardians, ExtractVer: 2}}
+	if err := s.SaveEvents(runID, 1, hash, events); err != nil {
+		t.Fatalf("SaveEvents: %v", err)
+	}
+
+	rows, err := s.LatestEvents(EventFilter{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("LatestEvents = %d rows, want 1", len(rows))
+	}
+	if rows[0].Children == nil || len(rows[0].Children) != 0 {
+		t.Errorf("children = %#v, want a non-nil empty slice (guardians-only, deliberately zero)", rows[0].Children)
+	}
+	if rows[0].Audience != extract.AudienceGuardians {
+		t.Errorf("audience = %q, want %q", rows[0].Audience, extract.AudienceGuardians)
+	}
+}
+
+func TestLatestEvents_LatestRunWins(t *testing.T) {
+	s := openTestStore(t)
+	msg := testMsg(1, "Ella", "/!1", "s", "body", time.Now())
+	if _, err := s.IngestMessage(msg); err != nil {
+		t.Fatal(err)
+	}
+	hash := contentHash(msg.Subject, msg.SentAtRaw, msg.BodyHTML)
+
+	run1 := testRun(t, s)
+	if err := s.SaveEvents(run1, 1, hash, []extract.Event{
+		{WilmaID: 1, Kind: "event", Title: "Old A", DateRaw: "1.1.", Quote: "q", Audience: extract.AudienceChild, ExtractVer: 1},
+		{WilmaID: 1, Kind: "event", Title: "Old B", DateRaw: "2.1.", Quote: "q", Audience: extract.AudienceChild, ExtractVer: 1},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	run2 := testRun(t, s)
+	if err := s.SaveEvents(run2, 1, hash, []extract.Event{
+		{WilmaID: 1, Kind: "event", Title: "New", DateRaw: "3.1.", Quote: "q", Audience: extract.AudienceChild, ExtractVer: 2},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	rows, err := s.LatestEvents(EventFilter{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 || rows[0].Title != "New" {
+		t.Fatalf("LatestEvents = %+v, want only run2's single event", rows)
+	}
+
+	var total int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM events`).Scan(&total); err != nil {
+		t.Fatal(err)
+	}
+	if total != 3 {
+		t.Errorf("total events rows = %d, want 3 (old run's rows are neither deleted nor mutated)", total)
+	}
+	var oldTitle string
+	if err := s.db.QueryRow(`SELECT title FROM events WHERE title = 'Old A'`).Scan(&oldTitle); err != nil {
+		t.Errorf("run1's event should still exist unmutated: %v", err)
+	}
+}
+
+func TestLatestEvents_RerunWithZeroEventsSupersedesOldOnes(t *testing.T) {
+	s := openTestStore(t)
+	msg := testMsg(1, "Ella", "/!1", "s", "body", time.Now())
+	if _, err := s.IngestMessage(msg); err != nil {
+		t.Fatal(err)
+	}
+	hash := contentHash(msg.Subject, msg.SentAtRaw, msg.BodyHTML)
+
+	run1 := testRun(t, s)
+	if err := s.SaveEvents(run1, 1, hash, []extract.Event{
+		{WilmaID: 1, Kind: "event", Title: "Stale", DateRaw: "1.1.", Quote: "q", Audience: extract.AudienceChild, ExtractVer: 1},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// A re-run correctly finds nothing this time (e.g. the model changed
+	// its mind, or the message genuinely has no actionable date under a
+	// revised prompt). SaveEvents must still be called with an empty slice
+	// -- this is the case run_messages exists to handle correctly.
+	run2 := testRun(t, s)
+	if err := s.SaveEvents(run2, 1, hash, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	rows, err := s.LatestEvents(EventFilter{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 0 {
+		t.Errorf("LatestEvents = %+v, want none (the zero-event rerun must supersede the stale event, not fall back to it)", rows)
+	}
+}
+
+func TestLatestEvents_FailedRerunKeepsPreviousGeneration(t *testing.T) {
+	s := openTestStore(t)
+	msg := testMsg(1, "Ella", "/!1", "s", "body", time.Now())
+	if _, err := s.IngestMessage(msg); err != nil {
+		t.Fatal(err)
+	}
+	hash := contentHash(msg.Subject, msg.SentAtRaw, msg.BodyHTML)
+
+	run1 := testRun(t, s)
+	if err := s.SaveEvents(run1, 1, hash, []extract.Event{
+		{WilmaID: 1, Kind: "event", Title: "Still current", DateRaw: "1.1.", Quote: "q", Audience: extract.AudienceChild, ExtractVer: 1},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// A second run starts but the extraction call itself fails: only
+	// SaveExtraction (the audit row) is recorded, never SaveEvents, so no
+	// run_messages coverage row exists for run2 either.
+	run2 := testRun(t, s)
+	if err := s.SaveExtraction(run2, 1, hash, "gemini-3.5-flash-lite", gemini.RawExchange{StatusCode: 500}, errors.New("server error")); err != nil {
+		t.Fatal(err)
+	}
+
+	rows, err := s.LatestEvents(EventFilter{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 || rows[0].Title != "Still current" {
+		t.Fatalf("LatestEvents = %+v, want run1's event still standing (a failed rerun must not blank out the previous generation)", rows)
+	}
+}
+
+func TestNeedsReview_OnlyLatestRun(t *testing.T) {
+	s := openTestStore(t)
+	msg := testMsg(1, "Ella", "/!1", "s", "body", time.Now())
+	if _, err := s.IngestMessage(msg); err != nil {
+		t.Fatal(err)
+	}
+	hash := contentHash(msg.Subject, msg.SentAtRaw, msg.BodyHTML)
+
+	run1 := testRun(t, s)
+	if err := s.SaveEvents(run1, 1, hash, []extract.Event{
+		{WilmaID: 1, Kind: "event", Title: "Flagged old", DateRaw: "1.1.", Quote: "q", Audience: extract.AudienceChild, NeedsReview: true, ReviewReasons: []string{"x"}, ExtractVer: 1},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	run2 := testRun(t, s)
+	if err := s.SaveEvents(run2, 1, hash, []extract.Event{
+		{WilmaID: 1, Kind: "event", Title: "Clean new", DateRaw: "2.1.", Quote: "q", Audience: extract.AudienceChild, NeedsReview: false, ExtractVer: 2},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	rows, err := s.NeedsReview()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 0 {
+		t.Errorf("NeedsReview() = %+v, want none: run2's event superseded run1's flagged one and isn't itself flagged", rows)
+	}
+}
+
+func TestReextractMessages_VersionForceSinceAndIDs(t *testing.T) {
+	s := openTestStore(t)
+	old := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	recent := time.Date(2026, 8, 1, 0, 0, 0, 0, time.UTC)
+
+	msg1 := testMsg(1, "Ella", "/!1", "s1", "body", old) // done, ver 1 -> eligible by version
+	if _, err := s.IngestMessage(msg1); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.MarkExtractDone(1, contentHash(msg1.Subject, msg1.SentAtRaw, msg1.BodyHTML), 1); err != nil {
+		t.Fatal(err)
+	}
+
+	msg2 := testMsg(2, "Ella", "/!1", "s2", "body", recent) // done, ver 2 already -> not eligible unless forced
+	if _, err := s.IngestMessage(msg2); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.MarkExtractDone(2, contentHash(msg2.Subject, msg2.SentAtRaw, msg2.BodyHTML), 2); err != nil {
+		t.Fatal(err)
+	}
+
+	msg3 := testMsg(3, "Ella", "/!1", "s3", "body", recent) // failed, extract_ver IS NULL -> must still be eligible
+	if _, err := s.IngestMessage(msg3); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.MarkExtractFailed(3, contentHash(msg3.Subject, msg3.SentAtRaw, msg3.BodyHTML), "boom", 1); err != nil {
+		t.Fatal(err)
+	}
+
+	msg4 := testMsg(4, "Ella", "/!1", "s4", "body", old) // still pending -> must never be returned
+	if _, err := s.IngestMessage(msg4); err != nil {
+		t.Fatal(err)
+	}
+
+	// Default: version-gated, no Since bound.
+	got, err := s.ReextractMessages(ReextractFilter{ExtractVer: 2, Limit: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	gotIDs := map[int64]bool{}
+	for _, pm := range got {
+		gotIDs[pm.WilmaID] = true
+	}
+	if !gotIDs[1] || !gotIDs[3] || gotIDs[2] || gotIDs[4] {
+		t.Errorf("version-gated ReextractMessages ids = %v, want {1,3} (2 is current, 4 is still pending, 3's NULL extract_ver must count as stale)", gotIDs)
+	}
+
+	// Force: ignores version, includes the already-current message too.
+	got, err = s.ReextractMessages(ReextractFilter{Force: true, Limit: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	gotIDs = map[int64]bool{}
+	for _, pm := range got {
+		gotIDs[pm.WilmaID] = true
+	}
+	if !gotIDs[1] || !gotIDs[2] || !gotIDs[3] {
+		t.Errorf("forced ReextractMessages ids = %v, want {1,2,3}", gotIDs)
+	}
+
+	// Since: only messages sent on/after the bound.
+	got, err = s.ReextractMessages(ReextractFilter{Force: true, Since: recent, Limit: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	gotIDs = map[int64]bool{}
+	for _, pm := range got {
+		gotIDs[pm.WilmaID] = true
+	}
+	if gotIDs[1] || !gotIDs[2] || !gotIDs[3] {
+		t.Errorf("Since-filtered ReextractMessages ids = %v, want {2,3} only", gotIDs)
+	}
+
+	// WilmaIDs: an explicit id list.
+	got, err = s.ReextractMessages(ReextractFilter{Force: true, WilmaIDs: []int64{2}, Limit: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].WilmaID != 2 {
+		t.Errorf("WilmaIDs-filtered ReextractMessages = %+v, want just message 2", got)
 	}
 }
 
@@ -316,14 +864,15 @@ func TestSaveExtraction_RecordsAuditRow(t *testing.T) {
 	}
 	hash := contentHash(msg.Subject, msg.SentAtRaw, msg.BodyHTML)
 
+	runID := testRun(t, s)
 	ex := gemini.RawExchange{
 		Request: []byte(`{"model":"gemini-3.5-flash-lite"}`), Response: []byte(`{"status":"completed"}`),
 		StatusCode: 200, Attempts: 1,
 	}
-	if err := s.SaveExtraction(9, hash, "gemini-3.5-flash-lite", ex, nil); err != nil {
+	if err := s.SaveExtraction(runID, 9, hash, "gemini-3.5-flash-lite", ex, nil); err != nil {
 		t.Fatalf("SaveExtraction (success): %v", err)
 	}
-	if err := s.SaveExtraction(9, hash, "gemini-3.5-flash-lite", gemini.RawExchange{StatusCode: 429, Attempts: 3}, errors.New("quota exceeded")); err != nil {
+	if err := s.SaveExtraction(runID, 9, hash, "gemini-3.5-flash-lite", gemini.RawExchange{StatusCode: 429, Attempts: 3}, errors.New("quota exceeded")); err != nil {
 		t.Fatalf("SaveExtraction (failure): %v", err)
 	}
 

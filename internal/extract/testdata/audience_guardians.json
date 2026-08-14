@@ -1,0 +1,85 @@
+{
+  "request": {
+    "model": "gemini-3.5-flash-lite",
+    "input": "Olet kouluviestien jäsentäjä. Poimi viestistä päivämäärälliset tapahtumat.\nSÄÄNNÖT:\n- Älä koskaan päättele vuotta. Palauta päivämäärä täsmälleen kirjoitetussa muodossa.\n- Älä koskaan luettele toistuvia tapahtumia; palauta recurrence {freq,count}.\n- Palauta weekday_claim jos viestissä lukee viikonpäivä (ma/ti/ke/to/pe/la/su).\n- items vain jos ne on nimenomaisesti mainittu.\n- quote = sanatarkka lainaus viestistä.\n- audience = \"child\" jos tapahtuma koskee oppilasta, \"guardians\" jos se on tarkoitettu vain huoltajille (esim. vanhempainilta).\n\nVIESTI:\nOtsikko: Vanhempainilta 26.8.\nTervetuloa uuteen lukuvuoteen! Vanhempainilta pidetään ke 26.8. koulun ruokalassa. Ilmoittautumista ei tarvita, tervetuloa kaikki huoltajat!",
+    "response_format": {
+      "type": "text",
+      "mime_type": "application/json",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "candidates": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "kind": {
+                  "type": "string",
+                  "enum": ["event", "deadline", "exam", "info"]
+                },
+                "title": { "type": "string" },
+                "detail": { "type": "string" },
+                "date": { "type": "string" },
+                "weekday_claim": { "type": "string" },
+                "time": { "type": "string" },
+                "location": { "type": "string" },
+                "items": {
+                  "type": "array",
+                  "items": { "type": "string" }
+                },
+                "link": { "type": "string" },
+                "recurrence": {
+                  "type": "object",
+                  "properties": {
+                    "freq": {
+                      "type": "string",
+                      "enum": ["daily", "weekly", "biweekly", "monthly"]
+                    },
+                    "count": { "type": "integer" }
+                  },
+                  "required": ["freq", "count"]
+                },
+                "audience": {
+                  "type": "string",
+                  "enum": ["child", "guardians"]
+                },
+                "confidence": { "type": "number" },
+                "quote": { "type": "string" }
+              },
+              "required": ["kind", "title", "date", "audience", "confidence", "quote"]
+            }
+          }
+        },
+        "required": ["candidates"]
+      }
+    }
+  },
+  "response": {
+    "id": "SYNTHETIC_NOT_A_LIVE_CAPTURE",
+    "status": "completed",
+    "usage": {
+      "total_tokens": 0,
+      "total_input_tokens": 0,
+      "total_output_tokens": 0
+    },
+    "created": "2026-08-14T00:00:00Z",
+    "steps": [
+      {
+        "signature": "SYNTHETIC",
+        "type": "thought"
+      },
+      {
+        "content": [
+          {
+            "text": "{\"candidates\": [{\"kind\": \"event\", \"title\": \"Vanhempainilta\", \"date\": \"26.8.\", \"weekday_claim\": \"ke\", \"audience\": \"guardians\", \"confidence\": 1.0, \"quote\": \"Vanhempainilta pidetään ke 26.8. koulun ruokalassa.\"}]}",
+            "type": "text"
+          }
+        ],
+        "type": "model_output"
+      }
+    ],
+    "object": "interaction",
+    "model": "gemini-3.5-flash-lite"
+  },
+  "_note": "SYNTHETIC -- not a live capture. Hand-constructed to unblock Go-side wiring for the audience field (ver 2). Unlike deadline.json (a real call reconstructed from a transcript), no live Interactions API call was ever made for this one -- the model_output text is a guess at what Gemini would return, not a record of what it did return. Do not trust audience=\"guardians\" classification in production until this is replaced with a genuine live capture over a real guardians-only message (e.g. a real vanhempainilta notice) and the schema.go required:[...,\"audience\",...] treatment is confirmed to actually stick, the same way recurrence.required=[freq,count] had to be proven live. See testdata/README.md."
+}

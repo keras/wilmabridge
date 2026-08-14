@@ -57,6 +57,8 @@ func run(args []string) int {
 		return cmdProbe(rest)
 	case "extract":
 		return cmdExtract(rest)
+	case "reextract":
+		return cmdReextract(rest)
 	case "ingest":
 		return cmdIngest(rest)
 	case "review":
@@ -87,11 +89,17 @@ Usage:
                                  nothing is written anywhere. With -db: pulls from
                                  the persistent pending queue instead of stdin, and
                                  saves results, in addition to still printing them.
+                                 -interval keeps draining the queue on a timer.
+  wilmabridge reextract [flags] re-run extraction over already-extracted -db
+                                 messages (e.g. a stronger -model, or after an
+                                 extract_ver bump). Latest run wins; nothing
+                                 already stored is deleted. -dry-run previews.
   wilmabridge ingest  [flags]   read sync's NDJSON on stdin, store it in -db
                                  (dedup across children; queue for extraction)
   wilmabridge review  [flags]   print events flagged needs_review from -db
   wilmabridge db last-id [flags]     print the stored per-role high-water mark(s)
   wilmabridge db set-last-id [flags] <id>  manually advance a role's high-water mark
+  wilmabridge db runs [flags]        print extraction run history (newest first)
 
 Credentials (required, env only):
   WILMA_USER       Wilma username
@@ -657,8 +665,11 @@ func cmdProbe(args []string) int {
 //
 // With -db, it instead pulls from that database's pending queue (populated
 // by `ingest`), persists the results (events, an extractions audit row, and
-// the message's extract_state/attempts), and *also* still prints the
-// events to stdout — so -v/piping keep working either way.
+// the message's extract_state/attempts) as one extraction run (see
+// internal/store's Run type and "wilmabridge reextract"), and *also* still
+// prints the events to stdout — so -v/piping keep working either way.
+// -interval keeps draining the pending queue on a timer instead of exiting
+// after one pass, the same idea as `poll -interval`.
 func cmdExtract(args []string) int {
 	fs := flag.NewFlagSet("extract", flag.ContinueOnError)
 	apiKeyEnv := fs.String("api-key-env", "AISTUDIO_KEY", "name of the env var holding the Gemini API key")
@@ -669,8 +680,19 @@ func cmdExtract(args []string) int {
 	dbPath := fs.String("db", os.Getenv("WILMA_DB"), "SQLite database path (default: $WILMA_DB); enables persistent pending-queue mode instead of reading stdin")
 	limit := fs.Int("limit", 20, "max pending messages to process this run (--db mode only)")
 	maxAttempts := fs.Int("max-attempts", 5, "mark a message failed (stop retrying) after this many failed runs (--db mode only)")
+	interval := fs.Duration("interval", 0, "if >0, keep draining the pending queue on this interval instead of exiting after one pass (minimum 1m; --db mode only)")
+	note := fs.String("note", "", "free text recorded on this run's extraction_runs row (default: \"pending queue\"; --db mode only)")
 	verbose := fs.Bool("v", false, "log request/response summaries to stderr (never the key)")
 	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+
+	if *interval != 0 && *interval < time.Minute {
+		fmt.Fprintln(os.Stderr, "wilmabridge: --interval must be at least 1m (0 disables it, meaning one pass then exit)")
+		return 2
+	}
+	if *interval != 0 && *dbPath == "" {
+		fmt.Fprintln(os.Stderr, "wilmabridge: --interval requires --db (stdin mode reads a finite stream, not an ongoing queue)")
 		return 2
 	}
 
@@ -692,7 +714,7 @@ func cmdExtract(args []string) int {
 	}
 
 	if *dbPath != "" {
-		return extractFromDB(client, *model, *dbPath, *limit, *maxAttempts, *delay)
+		return extractFromDB(client, *model, *dbPath, *limit, *maxAttempts, *delay, *interval, *note, *verbose)
 	}
 	return extractFromStdin(client, *delay)
 }
@@ -755,33 +777,75 @@ func extractFromStdin(client *gemini.Client, delay time.Duration) int {
 	return exitCode
 }
 
-// extractFromDB pulls the pending queue from a SQLite database (populated
-// by `ingest`), extracts each, and persists events + an extractions audit
-// row + the message's new extract_state, while still streaming events to
-// stdout exactly like the stdin mode does.
-func extractFromDB(client *gemini.Client, model, dbPath string, limit, maxAttempts int, delay time.Duration) int {
-	st, err := store.Open(dbPath)
+// batchSelector picks the messages one extraction pass will work on. It's
+// the only thing that differs between `extract --db` (the pending queue)
+// and `reextract` (already-extracted messages eligible for another go).
+type batchSelector func(*store.Store) ([]store.PendingMessage, error)
+
+// extractOptions configures one extractPass/extractLoop.
+type extractOptions struct {
+	Model       string
+	MaxAttempts int
+	Delay       time.Duration
+	Note        string // recorded on this pass's extraction_runs row
+	Verbose     bool
+}
+
+// sleepCtx pauses for d, or returns early if ctx is cancelled first — used
+// between HTTP calls so a shutdown doesn't have to wait out a full delay.
+func sleepCtx(ctx context.Context, d time.Duration) {
+	select {
+	case <-ctx.Done():
+	case <-time.After(d):
+	}
+}
+
+// extractPass runs one extraction run end to end: select a batch via sel,
+// open a run, extract/save/mark each message, close the run, stream events
+// to enc. Creates no run and prints nothing when the batch is empty, so a
+// cron'd or --interval'd pass with nothing to do stays silent (poll's
+// "under cron, output means mail" rule). processed counts messages
+// successfully extracted and stored; exitCode follows this project's usual
+// convention (0 clean, 1 any message-level failure).
+func extractPass(ctx context.Context, st *store.Store, client *gemini.Client, sel batchSelector, opt extractOptions, enc *json.Encoder, out *bufio.Writer) (processed, exitCode int) {
+	batch, err := sel(st)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "wilmabridge:", err)
-		return 1
+		return 0, 1
 	}
-	defer st.Close()
+	if len(batch) == 0 {
+		return 0, 0
+	}
 
-	pending, err := st.PendingMessages(limit)
+	note := opt.Note
+	if note == "" {
+		note = "pending queue"
+	}
+	runID, err := st.StartRun(opt.Model, extract.ExtractVer, note)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "wilmabridge:", err)
-		return 1
+		return 0, 1
+	}
+	finish := func() {
+		if err := st.FinishRun(runID); err != nil {
+			fmt.Fprintf(os.Stderr, "wilmabridge: finishing run %d: %v\n", runID, err)
+		}
+		if err := out.Flush(); err != nil {
+			fmt.Fprintln(os.Stderr, "wilmabridge: writing output:", err)
+			exitCode = 1
+		}
 	}
 
-	out := bufio.NewWriter(os.Stdout)
-	defer out.Flush()
-	enc := json.NewEncoder(out)
-
-	ctx := context.Background()
-	exitCode := 0
-	for i, pm := range pending {
+	consecutiveFailures := 0
+	for i, pm := range batch {
+		if ctx.Err() != nil {
+			break
+		}
 		if i > 0 {
-			time.Sleep(delay)
+			sleepCtx(ctx, opt.Delay)
+			if ctx.Err() != nil {
+				break
+			}
 		}
 
 		msg := wilma.Message{
@@ -790,21 +854,36 @@ func extractFromDB(client *gemini.Client, model, dbPath string, limit, maxAttemp
 		}
 		events, exchange, extractErr := extract.ExtractMessage(ctx, client, msg)
 
-		if err := st.SaveExtraction(pm.WilmaID, pm.ContentHash, model, exchange, extractErr); err != nil {
+		if err := st.SaveExtraction(runID, pm.WilmaID, pm.ContentHash, opt.Model, exchange, extractErr); err != nil {
 			fmt.Fprintf(os.Stderr, "wilmabridge: recording extraction audit for message %d: %v\n", pm.WilmaID, err)
 			exitCode = 1
 		}
 
 		if extractErr != nil {
+			if ctx.Err() != nil {
+				// Cancelled mid-call: this was never a fair attempt, so
+				// don't burn retry budget on it via MarkExtractFailed.
+				break
+			}
 			fmt.Fprintf(os.Stderr, "wilmabridge: extracting message %d: %v\n", pm.WilmaID, extractErr)
-			if err := st.MarkExtractFailed(pm.WilmaID, pm.ContentHash, extractErr.Error(), maxAttempts); err != nil {
+			if err := st.MarkExtractFailed(pm.WilmaID, pm.ContentHash, extractErr.Error(), opt.MaxAttempts); err != nil {
 				fmt.Fprintf(os.Stderr, "wilmabridge: marking message %d failed: %v\n", pm.WilmaID, err)
 			}
 			exitCode = 1
+			consecutiveFailures++
+			if consecutiveFailures >= 3 {
+				// A dead API key or a Gemini outage would otherwise burn
+				// every remaining message's retry budget in one pass, with
+				// no requeue command today to undo it. Stop and let the
+				// next tick (or the next cron invocation) try again.
+				fmt.Fprintln(os.Stderr, "wilmabridge: extract: 3 consecutive failures, aborting this pass")
+				break
+			}
 			continue
 		}
+		consecutiveFailures = 0
 
-		if err := st.SaveEvents(pm.WilmaID, pm.ContentHash, events); err != nil {
+		if err := st.SaveEvents(runID, pm.WilmaID, pm.ContentHash, events); err != nil {
 			fmt.Fprintf(os.Stderr, "wilmabridge: saving events for message %d: %v\n", pm.WilmaID, err)
 			exitCode = 1
 			continue
@@ -814,15 +893,183 @@ func extractFromDB(client *gemini.Client, model, dbPath string, limit, maxAttemp
 			exitCode = 1
 			continue
 		}
+		processed++
 
 		for _, ev := range events {
 			if err := enc.Encode(ev); err != nil {
 				fmt.Fprintln(os.Stderr, "wilmabridge: writing output:", err)
-				return 1
+				exitCode = 1
+				finish()
+				return processed, exitCode
 			}
 		}
 	}
 
+	finish()
+	return processed, exitCode
+}
+
+// extractLoop repeats extractPass on a timer until SIGINT/SIGTERM. Simpler
+// than poll's interval loop: there's no Wilma session to keep alive or
+// re-establish, just Gemini calls and DB writes, so a failed pass just
+// waits for the next tick.
+func extractLoop(st *store.Store, client *gemini.Client, sel batchSelector, opt extractOptions, enc *json.Encoder, out *bufio.Writer, interval time.Duration) int {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	for {
+		if ctx.Err() != nil {
+			return 0
+		}
+		if _, exitCode := extractPass(ctx, st, client, sel, opt, enc, out); exitCode != 0 && ctx.Err() == nil {
+			fmt.Fprintln(os.Stderr, "wilmabridge: extract: pass failed, will retry next tick")
+		}
+
+		select {
+		case <-ctx.Done():
+			return 0
+		case <-time.After(interval):
+		}
+	}
+}
+
+// extractFromDB pulls the pending queue from a SQLite database (populated
+// by `ingest`), extracts each, and persists events + an extractions audit
+// row + the message's new extract_state, while still streaming events to
+// stdout exactly like the stdin mode does. interval>0 keeps doing this on a
+// timer instead of exiting after one pass.
+func extractFromDB(client *gemini.Client, model, dbPath string, limit, maxAttempts int, delay, interval time.Duration, note string, verbose bool) int {
+	st, err := store.Open(dbPath)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "wilmabridge:", err)
+		return 1
+	}
+	defer st.Close()
+
+	out := bufio.NewWriter(os.Stdout)
+	defer out.Flush()
+	enc := json.NewEncoder(out)
+
+	opt := extractOptions{Model: model, MaxAttempts: maxAttempts, Delay: delay, Note: note, Verbose: verbose}
+	sel := func(st *store.Store) ([]store.PendingMessage, error) { return st.PendingMessages(limit) }
+
+	if interval > 0 {
+		return extractLoop(st, client, sel, opt, enc, out, interval)
+	}
+
+	_, exitCode := extractPass(context.Background(), st, client, sel, opt, enc, out)
+	return exitCode
+}
+
+// repeatedInt64Flag collects repeated -id flags into a slice.
+type repeatedInt64Flag []int64
+
+func (r *repeatedInt64Flag) String() string {
+	parts := make([]string, len(*r))
+	for i, id := range *r {
+		parts[i] = strconv.FormatInt(id, 10)
+	}
+	return strings.Join(parts, ",")
+}
+
+func (r *repeatedInt64Flag) Set(v string) error {
+	id, err := strconv.ParseInt(v, 10, 64)
+	if err != nil {
+		return fmt.Errorf("%q is not a valid wilma_id: %w", v, err)
+	}
+	*r = append(*r, id)
+	return nil
+}
+
+// cmdReextract re-runs extraction over messages that already have a result
+// — the escape hatch for "the prompt improved" or "this deserves a stronger
+// model" that `extract` (pending-queue only) deliberately doesn't cover.
+// Built on the same extractPass/batchSelector as extract --db; the only
+// difference is which messages the selector returns. Nothing already stored
+// is ever deleted or mutated: see internal/store's LatestEvents doc comment
+// for how "latest run wins" is derived, not flagged.
+func cmdReextract(args []string) int {
+	fs := flag.NewFlagSet("reextract", flag.ContinueOnError)
+	dbPath := fs.String("db", os.Getenv("WILMA_DB"), "SQLite database path (default: $WILMA_DB)")
+	apiKeyEnv := fs.String("api-key-env", "AISTUDIO_KEY", "name of the env var holding the Gemini API key")
+	model := fs.String("model", "gemini-3.5-flash-lite", "Gemini model id")
+	baseURL := fs.String("base-url", "", "override the Interactions API base URL (default: real endpoint)")
+	delay := fs.Duration("delay", 200*time.Millisecond, "pause between API calls")
+	maxRetries := fs.Int("max-retries", 3, "max attempts on 429/5xx before giving up on a message, within one call")
+	maxAttempts := fs.Int("max-attempts", 5, "mark a message failed (stop retrying) after this many failed runs")
+	limit := fs.Int("limit", 20, "max messages to process this run (a reextract costs real money; deliberately not unlimited)")
+	force := fs.Bool("force", false, "ignore extract_ver; redo even messages already extracted at the current version")
+	since := fs.Duration("since", 0, "only messages sent within this duration before now (0 = no lower bound)")
+	var ids repeatedInt64Flag
+	fs.Var(&ids, "id", "restrict to one wilma_id; repeatable")
+	note := fs.String("note", "", "free text recorded on this run's extraction_runs row (default: auto-generated)")
+	dryRun := fs.Bool("dry-run", false, "print the selected messages and exit; no Gemini calls, no run created")
+	verbose := fs.Bool("v", false, "log request/response summaries to stderr (never the key)")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	if *dbPath == "" {
+		fmt.Fprintln(os.Stderr, "wilmabridge: --db or $WILMA_DB is required")
+		return 2
+	}
+
+	st, err := store.Open(*dbPath)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "wilmabridge:", err)
+		return 1
+	}
+	defer st.Close()
+
+	filter := store.ReextractFilter{ExtractVer: extract.ExtractVer, Force: *force, Limit: *limit, WilmaIDs: ids}
+	if *since > 0 {
+		filter.Since = time.Now().Add(-*since)
+	}
+
+	if *dryRun {
+		candidates, err := st.ReextractMessages(filter)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "wilmabridge:", err)
+			return 1
+		}
+		for _, pm := range candidates {
+			fmt.Printf("%d\t%s\t%s\n", pm.WilmaID, pm.SentAtRaw, pm.Subject)
+		}
+		fmt.Fprintf(os.Stderr, "wilmabridge: reextract: %d messages selected (dry run, no Gemini calls made)\n", len(candidates))
+		return 0
+	}
+
+	apiKey := os.Getenv(*apiKeyEnv)
+	if apiKey == "" {
+		fmt.Fprintf(os.Stderr, "wilmabridge: $%s is not set\n", *apiKeyEnv)
+		return 2
+	}
+	log := verboseLogger(*verbose)
+	opts := []gemini.Option{gemini.WithMaxRetries(*maxRetries), gemini.WithVerbose(log)}
+	if *baseURL != "" {
+		opts = append(opts, gemini.WithBaseURL(*baseURL))
+	}
+	client, err := gemini.NewClient(apiKey, *model, opts...)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "wilmabridge:", err)
+		return 1
+	}
+
+	runNote := *note
+	if runNote == "" {
+		runNote = fmt.Sprintf("reextract model=%s force=%v", *model, *force)
+	}
+
+	out := bufio.NewWriter(os.Stdout)
+	defer out.Flush()
+	enc := json.NewEncoder(out)
+
+	opt := extractOptions{Model: *model, MaxAttempts: *maxAttempts, Delay: *delay, Note: runNote, Verbose: *verbose}
+	sel := func(st *store.Store) ([]store.PendingMessage, error) { return st.ReextractMessages(filter) }
+
+	processed, exitCode := extractPass(context.Background(), st, client, sel, opt, enc, out)
+	if processed == 0 && exitCode == 0 {
+		fmt.Fprintln(os.Stderr, "wilmabridge: reextract: nothing eligible (try --force, or check --since/--id)")
+	}
 	return exitCode
 }
 
@@ -942,12 +1189,13 @@ func cmdReview(args []string) int {
 	return 0
 }
 
-// cmdDB dispatches "db" subcommands: last-id (inspect) and set-last-id
-// (manual override); the namespace exists so future inspection commands
-// (stats, agenda, ...) have a home that isn't the top-level command list.
+// cmdDB dispatches "db" subcommands: last-id/set-last-id (sync/poll
+// bookkeeping) and runs (extraction run history); the namespace exists so
+// inspection commands like these have a home that isn't the top-level
+// command list.
 func cmdDB(args []string) int {
 	if len(args) == 0 {
-		fmt.Fprintln(os.Stderr, "wilmabridge: db: expected a subcommand (last-id, set-last-id)")
+		fmt.Fprintln(os.Stderr, "wilmabridge: db: expected a subcommand (last-id, set-last-id, runs)")
 		return 2
 	}
 	sub, rest := args[0], args[1:]
@@ -956,10 +1204,51 @@ func cmdDB(args []string) int {
 		return cmdDBLastID(rest)
 	case "set-last-id":
 		return cmdDBSetLastID(rest)
+	case "runs":
+		return cmdDBRuns(rest)
 	default:
 		fmt.Fprintf(os.Stderr, "wilmabridge: db: unknown subcommand %q\n", sub)
 		return 2
 	}
+}
+
+// cmdDBRuns prints extraction run history as NDJSON — the only other way to
+// see it is querying extraction_runs directly with sqlite3. Newest first.
+func cmdDBRuns(args []string) int {
+	fs := flag.NewFlagSet("db runs", flag.ContinueOnError)
+	dbPath := fs.String("db", os.Getenv("WILMA_DB"), "SQLite database path (default: $WILMA_DB)")
+	limit := fs.Int("limit", 20, "max runs to print, newest first")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	if *dbPath == "" {
+		fmt.Fprintln(os.Stderr, "wilmabridge: --db or $WILMA_DB is required")
+		return 2
+	}
+
+	st, err := store.Open(*dbPath)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "wilmabridge:", err)
+		return 1
+	}
+	defer st.Close()
+
+	runs, err := st.Runs(*limit)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "wilmabridge:", err)
+		return 1
+	}
+
+	out := bufio.NewWriter(os.Stdout)
+	defer out.Flush()
+	enc := json.NewEncoder(out)
+	for _, r := range runs {
+		if err := enc.Encode(r); err != nil {
+			fmt.Fprintln(os.Stderr, "wilmabridge: writing output:", err)
+			return 1
+		}
+	}
+	return 0
 }
 
 func cmdDBLastID(args []string) int {

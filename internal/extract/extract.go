@@ -34,9 +34,9 @@ func ExtractMessage(ctx context.Context, client *gemini.Client, msg wilma.Messag
 		MessageURL:     msg.URL,
 		SentAt:         msg.SentAt,
 	}
-	events := make([]Event, 0, len(cr.Candidates))
+	var events []Event
 	for _, c := range cr.Candidates {
-		events = append(events, BuildEvent(src, c))
+		events = append(events, BuildEvent(src, c)...)
 	}
 	return events, exchange, nil
 }
