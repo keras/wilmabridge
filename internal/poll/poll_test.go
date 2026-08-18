@@ -528,6 +528,86 @@ func TestPass_HonoursMarksWrittenByIngest(t *testing.T) {
 	}
 }
 
+func TestPass_NewMessageFiresOnceForNewMessagesOnly(t *testing.T) {
+	sink := openTestStore(t)
+	src := newFakeSource()
+	role := "/!111"
+	src.lists[role] = []wilma.Message{newMsg(1, daysAgo(2)), newMsg(2, daysAgo(1))}
+	opt := testOptions()
+	var got []int64
+	opt.NewMessage = func(m wilma.Message) error {
+		got = append(got, m.ID)
+		return nil
+	}
+
+	if _, err := Pass(context.Background(), src, sink, []Role{{Prefix: role, Name: "Ella"}}, opt); err != nil {
+		t.Fatalf("first pass: %v", err)
+	}
+	if len(got) != 2 || got[0] != 1 || got[1] != 2 {
+		t.Fatalf("got = %v, want [1 2] emitted on the bootstrap pass", got)
+	}
+
+	// A second pass with nothing new must not re-emit.
+	got = nil
+	if _, err := Pass(context.Background(), src, sink, []Role{{Prefix: role, Name: "Ella"}}, opt); err != nil {
+		t.Fatalf("second pass: %v", err)
+	}
+	if len(got) != 0 {
+		t.Errorf("got = %v, want nothing re-emitted on a no-op pass", got)
+	}
+}
+
+func TestPass_NewMessageFiresOnceAcrossSharedRoles(t *testing.T) {
+	sink := openTestStore(t)
+	src := newFakeSource()
+	roleA, roleB := "/!111", "/!222"
+	shared := newMsg(501, daysAgo(1))
+	src.lists[roleA] = []wilma.Message{shared}
+	src.lists[roleB] = []wilma.Message{shared}
+	opt := testOptions()
+	opt.Bootstrap = 0
+	var got []int64
+	opt.NewMessage = func(m wilma.Message) error {
+		got = append(got, m.ID)
+		return nil
+	}
+
+	if _, err := Pass(context.Background(), src, sink, []Role{{Prefix: roleA, Name: "Ella"}, {Prefix: roleB, Name: "Jooa"}}, opt); err != nil {
+		t.Fatalf("Pass: %v", err)
+	}
+	if len(got) != 1 || got[0] != 501 {
+		t.Errorf("got = %v, want [501] emitted once despite being ingested for two roles", got)
+	}
+}
+
+func TestPass_NewMessageErrorIsRoleFatal(t *testing.T) {
+	sink := openTestStore(t)
+	src := newFakeSource()
+	role := "/!111"
+	src.lists[role] = []wilma.Message{newMsg(1, daysAgo(2)), newMsg(2, daysAgo(1))}
+	opt := testOptions()
+	opt.Bootstrap = 0
+	wantErr := errors.New("broken pipe")
+	opt.NewMessage = func(m wilma.Message) error {
+		if m.ID == 2 {
+			return wantErr
+		}
+		return nil
+	}
+
+	res, err := Pass(context.Background(), src, sink, []Role{{Prefix: role, Name: "Ella"}}, opt)
+	if err != nil {
+		t.Fatalf("Pass returned a pass-fatal error for a non-expiry emit failure: %v", err)
+	}
+	rr := res.Roles[0]
+	if rr.Err == nil || !errors.Is(rr.Err, wantErr) {
+		t.Fatalf("rr.Err = %v, want it to wrap %v", rr.Err, wantErr)
+	}
+	if rr.Ingested != 2 || rr.MarkAfter != 1 {
+		t.Errorf("rr = %+v, want Ingested=2 MarkAfter=1 (message 2 was stored but its failed emit must stop the mark from advancing past it)", rr)
+	}
+}
+
 func TestPass_NothingInBootstrapWindowLeavesMarkUnset(t *testing.T) {
 	sink := openTestStore(t)
 	src := newFakeSource()

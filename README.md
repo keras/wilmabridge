@@ -357,6 +357,7 @@ does this bookkeeping internally, per role, every time it runs:
 | `--bodies` | `true` | fetch full message bodies — **see the warning below if you turn this off** |
 | `--delay` | `300ms` | pause between HTTP requests |
 | `-v` | off | log HTTP requests plus per-role/per-message detail to stderr |
+| `--emit-new` | off | write each newly-stored message as NDJSON to stdout, one `wilma.Message` object per line — for piping into a delivery agent (e.g. something that posts new messages to Slack) |
 
 > **`--bodies=false` warning.** Unlike `sync`, `poll` writes to a database that `extract`
 > later reads from. A message ingested without a body is stored `extract_state=skipped`
@@ -379,6 +380,25 @@ A clean pass with nothing new prints nothing (cron-friendly — output should me
 happened). `-v` always prints a per-role and totals summary, useful as a heartbeat under
 `--interval`.
 
+### `--emit-new`: streaming new messages to another process
+
+By default `poll` writes nothing to stdout, only its stderr summary. Pass `--emit-new` to
+additionally write every newly-stored message to stdout as NDJSON, flushed as soon as it's
+stored — including under `--interval`, so a downstream consumer sees each message close to
+real time rather than batched at process exit:
+
+```sh
+wilmabridge poll --db wilma.db --interval 15m --emit-new | your-delivery-agent
+```
+
+A message shared across two children's roles (see "Limitations" below) is only emitted
+once, on whichever role's fan-out stores it first — the same dedup `messages` itself
+applies. A resumed pass after an interrupted one never re-emits a message it already
+emitted, since the emit only fires when a message is newly stored, not on every message a
+pass merely selects. If the downstream process closes its end of the pipe, the write fails
+and that's treated the same as any other storage error: it stops that role for the pass and
+is reported like any other role failure, rather than being silently dropped.
+
 ### Limitations
 
 - Inbox only — there's no `--folder` flag, because the high-water mark is keyed by role
@@ -391,7 +411,7 @@ happened). `-v` always prints a per-role and totals summary, useful as a heartbe
   It refuses to move a mark backward (same guarantee `poll` itself relies on), so it can't
   be used to accidentally force a re-fetch of history.
 
-## Persistence: `ingest`, `extract --db`, `review`, `db last-id`
+## Persistence: `ingest`, `extract --db`, `review`, `events`, `db last-id`
 
 ```sh
 export WILMA_DB=wilma.db     # or pass --db explicitly on each command below
@@ -429,6 +449,20 @@ to concern both.
   that fans out to every child linked to the message (`"child"`) or to none at all
   (`"guardians"`) — `children` is always present, `[]` rather than omitted when it's empty,
   so "deliberately zero" is never confused with "not computed".
+- **`wilmabridge events --db <path> --on <expr>`** — NDJSON of every **current** event (same
+  "latest run wins" rule as `review`) whose `resolved_date` falls on `--on`. `--on` accepts an
+  exact ISO date (`"2026-07-19"`), `"today"`, `"tomorrow"`, `"this week"`, or `"next week"`
+  (Monday–Sunday, matching the Finnish school-week convention; an unrecognized expression is
+  an error, not a guess). Unlike `review`, output is chronological (earliest
+  date/time first) rather than most-recently-extracted-first, since this reads as a schedule.
+  An event whose date extraction couldn't resolve (`resolved_date` empty) never matches.
+  Meant as the query surface a downstream agent polls to decide what's worth an extra
+  notification to guardians right now — `wilmabridge` itself sends nothing; see
+  `openclaw-integration.md` for where that delivery layer is headed.
+  ```sh
+  wilmabridge events --db wilma.db --on tomorrow
+  wilmabridge events --db wilma.db --on "next week"
+  ```
 - **`wilmabridge db last-id --db <path> [--role <prefix>]`** — prints the stored per-role
   high-water mark and when that role was last polled. Historically the way to feed `sync
   --after` for a cron job (`sync --after $(wilmabridge db last-id --role !X) | ingest`);

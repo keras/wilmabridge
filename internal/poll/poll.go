@@ -79,6 +79,16 @@ type Options struct {
 	// which marks them read in Wilma. Nil discards it; cmd/wilmabridge
 	// always wires this to a real stderr printer.
 	Warn func(string, ...any)
+	// NewMessage, if set, is called once for every message that is newly
+	// stored this pass (store.IngestMessage reported isNew=true) — a
+	// message shared across two children's roles fires this only on the
+	// role that first stores it, matching the messages table's own
+	// dedup. Nil disables it. An error from NewMessage is role-fatal,
+	// exactly like a store error: it stops that role's pass so a
+	// downstream delivery failure (e.g. a broken pipe) surfaces
+	// immediately rather than silently dropping messages, consistent
+	// with poll's "under cron, output means mail" philosophy.
+	NewMessage func(wilma.Message) error
 }
 
 func (o Options) now() time.Time {
@@ -318,6 +328,12 @@ func pollRole(ctx context.Context, src Source, sink Sink, role Role, opt Options
 		rr.Ingested++
 		if isNew {
 			rr.New++
+			if opt.NewMessage != nil {
+				if err := opt.NewMessage(m); err != nil {
+					rr.Err = fmt.Errorf("emitting message %d: %w", m.ID, err)
+					break
+				}
+			}
 		}
 
 		if err := sink.SetHighWaterMark(role.Prefix, m.ID); err != nil {

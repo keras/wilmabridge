@@ -633,7 +633,14 @@ type ReviewRow = EventRow
 // event.
 type EventFilter struct {
 	NeedsReviewOnly bool
-	Limit           int // 0 = no limit
+	// DateFrom/DateTo, if both non-empty, restrict to events whose
+	// resolved_date falls in this inclusive range (ISO "YYYY-MM-DD",
+	// lexically comparable). An event with no resolved_date (extraction
+	// couldn't place it on a date) never matches a date-filtered query.
+	// See internal/dateexpr for turning a human expression like "next
+	// week" into this range.
+	DateFrom, DateTo string
+	Limit            int // 0 = no limit
 }
 
 // LatestEvents returns each message's CURRENT events: the ones produced by
@@ -660,10 +667,25 @@ func (s *Store) LatestEvents(f EventFilter) ([]EventRow, error) {
 		JOIN events e ON e.wilma_id = l.wilma_id AND e.content_hash = l.content_hash AND e.run_id = l.run_id
 		JOIN messages m ON m.wilma_id = e.wilma_id AND m.content_hash = e.content_hash`
 	var args []any
+	var conditions []string
 	if f.NeedsReviewOnly {
-		query += ` WHERE e.needs_review = 1`
+		conditions = append(conditions, `e.needs_review = 1`)
 	}
-	query += ` ORDER BY e.id DESC`
+	dateFiltered := f.DateFrom != "" && f.DateTo != ""
+	if dateFiltered {
+		conditions = append(conditions, `e.resolved_date BETWEEN ? AND ?`)
+		args = append(args, f.DateFrom, f.DateTo)
+	}
+	if len(conditions) > 0 {
+		query += ` WHERE ` + strings.Join(conditions, " AND ")
+	}
+	if dateFiltered {
+		// Chronological, not most-recently-extracted-first -- an
+		// agenda-style query reads as a schedule, not a change log.
+		query += ` ORDER BY e.resolved_date ASC, e.time ASC, e.id ASC`
+	} else {
+		query += ` ORDER BY e.id DESC`
+	}
 	if f.Limit > 0 {
 		query += ` LIMIT ?`
 		args = append(args, f.Limit)

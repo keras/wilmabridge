@@ -698,6 +698,53 @@ func TestLatestEvents_FailedRerunKeepsPreviousGeneration(t *testing.T) {
 	}
 }
 
+func TestLatestEvents_DateRangeFilter(t *testing.T) {
+	s := openTestStore(t)
+	msg := testMsg(1, "Ella", "/!1", "s", "body", time.Now())
+	if _, err := s.IngestMessage(msg); err != nil {
+		t.Fatal(err)
+	}
+	hash := contentHash(msg.Subject, msg.SentAtRaw, msg.BodyHTML)
+
+	run := testRun(t, s)
+	if err := s.SaveEvents(run, 1, hash, []extract.Event{
+		{WilmaID: 1, Kind: "event", Title: "Before", DateRaw: "x", Quote: "q", Audience: extract.AudienceChild, ResolvedDate: "2026-07-18", ExtractVer: 1},
+		{WilmaID: 1, Kind: "event", Title: "In range, later", DateRaw: "x", Quote: "q", Audience: extract.AudienceChild, ResolvedDate: "2026-07-19", Time: "14:00", ExtractVer: 1},
+		{WilmaID: 1, Kind: "event", Title: "In range, earlier", DateRaw: "x", Quote: "q", Audience: extract.AudienceChild, ResolvedDate: "2026-07-19", Time: "09:00", ExtractVer: 1},
+		{WilmaID: 1, Kind: "event", Title: "After", DateRaw: "x", Quote: "q", Audience: extract.AudienceChild, ResolvedDate: "2026-07-20", ExtractVer: 1},
+		{WilmaID: 1, Kind: "event", Title: "Unresolved", DateRaw: "x", Quote: "q", Audience: extract.AudienceChild, ResolvedDate: "", ExtractVer: 1},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	rows, err := s.LatestEvents(EventFilter{DateFrom: "2026-07-19", DateTo: "2026-07-19"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 2 {
+		t.Fatalf("LatestEvents = %+v, want exactly the 2 events resolved to 2026-07-19", rows)
+	}
+	if rows[0].Title != "In range, earlier" || rows[1].Title != "In range, later" {
+		t.Errorf("got titles [%s, %s], want chronological order by time within the same date", rows[0].Title, rows[1].Title)
+	}
+
+	rows, err = s.LatestEvents(EventFilter{DateFrom: "2026-07-19", DateTo: "2026-07-20"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 3 {
+		t.Errorf("LatestEvents = %+v, want the 2 events on 2026-07-19 plus the 1 on 2026-07-20", rows)
+	}
+
+	rows, err = s.LatestEvents(EventFilter{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 5 {
+		t.Errorf("LatestEvents with no date filter = %d rows, want all 5 including the unresolved one", len(rows))
+	}
+}
+
 func TestNeedsReview_OnlyLatestRun(t *testing.T) {
 	s := openTestStore(t)
 	msg := testMsg(1, "Ella", "/!1", "s", "body", time.Now())

@@ -25,6 +25,7 @@ import (
 	"syscall"
 	"time"
 
+	"wilmabridge/internal/dateexpr"
 	"wilmabridge/internal/extract"
 	"wilmabridge/internal/gemini"
 	"wilmabridge/internal/poll"
@@ -63,6 +64,8 @@ func run(args []string) int {
 		return cmdIngest(rest)
 	case "review":
 		return cmdReview(rest)
+	case "events":
+		return cmdEvents(rest)
 	case "db":
 		return cmdDB(rest)
 	case "help", "-h", "--help":
@@ -97,6 +100,9 @@ Usage:
   wilmabridge ingest  [flags]   read sync's NDJSON on stdin, store it in -db
                                  (dedup across children; queue for extraction)
   wilmabridge review  [flags]   print events flagged needs_review from -db
+  wilmabridge events  [flags]   print events landing on a date from -db (-on
+                                 "2026-07-19", "today", "tomorrow", "this week",
+                                 "next week")
   wilmabridge db last-id [flags]     print the stored per-role high-water mark(s)
   wilmabridge db set-last-id [flags] <id>  manually advance a role's high-water mark
   wilmabridge db runs [flags]        print extraction run history (newest first)
@@ -385,6 +391,7 @@ func cmdPoll(args []string) int {
 	bodies := fs.Bool("bodies", true, "fetch full message bodies (false = metadata only; see README's poll section)")
 	delay := fs.Duration("delay", 300*time.Millisecond, "pause between HTTP requests")
 	verbose := fs.Bool("v", false, "log requests and per-role/per-message detail to stderr")
+	emitNew := fs.Bool("emit-new", false, "write each newly-stored message as NDJSON to stdout (for piping into a delivery agent)")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -432,6 +439,17 @@ func cmdPoll(args []string) int {
 	}
 	if *verbose {
 		opt.Log = func(format string, args ...any) { fmt.Fprintf(os.Stderr, format+"\n", args...) }
+	}
+	if *emitNew {
+		out := bufio.NewWriter(os.Stdout)
+		defer out.Flush()
+		enc := json.NewEncoder(out)
+		opt.NewMessage = func(m wilma.Message) error {
+			if err := enc.Encode(m); err != nil {
+				return err
+			}
+			return out.Flush()
+		}
 	}
 
 	roleLabels := parseChildren(*children)
@@ -1172,6 +1190,61 @@ func cmdReview(args []string) int {
 	defer st.Close()
 
 	rows, err := st.NeedsReview()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "wilmabridge:", err)
+		return 1
+	}
+
+	out := bufio.NewWriter(os.Stdout)
+	defer out.Flush()
+	enc := json.NewEncoder(out)
+	for _, r := range rows {
+		if err := enc.Encode(r); err != nil {
+			fmt.Fprintln(os.Stderr, "wilmabridge: writing output:", err)
+			return 1
+		}
+	}
+	return 0
+}
+
+// cmdEvents prints, as NDJSON, every CURRENT event (latest run per message,
+// same rule LatestEvents/review use) whose resolved_date falls on -on's
+// resolved date or date range. It exists so a downstream agent can ask "what
+// matters right now" and compose an out-of-band notification to guardians —
+// wilmabridge itself sends nothing; see internal/dateexpr for the supported
+// -on vocabulary. Output is chronological (earliest date/time first), unlike
+// review's most-recently-extracted-first order, since this reads as a
+// schedule rather than a change log.
+func cmdEvents(args []string) int {
+	fs := flag.NewFlagSet("events", flag.ContinueOnError)
+	dbPath := fs.String("db", os.Getenv("WILMA_DB"), "SQLite database path (default: $WILMA_DB)")
+	on := fs.String("on", "", `date expression: an ISO date ("2026-07-19"), "today", "tomorrow", "this week", or "next week"`)
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	if *dbPath == "" {
+		fmt.Fprintln(os.Stderr, "wilmabridge: --db or $WILMA_DB is required")
+		return 2
+	}
+	if *on == "" {
+		fmt.Fprintln(os.Stderr, "wilmabridge: events: -on is required")
+		return 2
+	}
+
+	from, to, err := dateexpr.Range(*on, time.Now().In(wilma.Helsinki))
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "wilmabridge: events:", err)
+		return 2
+	}
+
+	st, err := store.Open(*dbPath)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "wilmabridge:", err)
+		return 1
+	}
+	defer st.Close()
+
+	rows, err := st.LatestEvents(store.EventFilter{DateFrom: from, DateTo: to})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "wilmabridge:", err)
 		return 1
