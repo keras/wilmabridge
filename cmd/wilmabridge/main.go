@@ -104,7 +104,7 @@ Usage:
 Credentials (required, env only):
   WILMA_USER       Wilma username
   WILMA_PASSWORD   Wilma password
-  AISTUDIO_KEY     Google AI Studio API key (extract only; see -api-key-env)
+  GEMINI_API_KEY   Google AI Studio API key (extract only; see -api-key-env)
 
 Stateless pipeline (no persistence):
   wilmabridge sync --since 168h | wilmabridge extract > events.ndjson
@@ -672,7 +672,7 @@ func cmdProbe(args []string) int {
 // after one pass, the same idea as `poll -interval`.
 func cmdExtract(args []string) int {
 	fs := flag.NewFlagSet("extract", flag.ContinueOnError)
-	apiKeyEnv := fs.String("api-key-env", "AISTUDIO_KEY", "name of the env var holding the Gemini API key")
+	apiKeyEnv := fs.String("api-key-env", "GEMINI_API_KEY", "name of the env var holding the Gemini API key")
 	model := fs.String("model", "gemini-3.5-flash-lite", "Gemini model id")
 	baseURL := fs.String("base-url", "", "override the Interactions API base URL (default: real endpoint)")
 	delay := fs.Duration("delay", 200*time.Millisecond, "pause between API calls")
@@ -991,7 +991,7 @@ func (r *repeatedInt64Flag) Set(v string) error {
 func cmdReextract(args []string) int {
 	fs := flag.NewFlagSet("reextract", flag.ContinueOnError)
 	dbPath := fs.String("db", os.Getenv("WILMA_DB"), "SQLite database path (default: $WILMA_DB)")
-	apiKeyEnv := fs.String("api-key-env", "AISTUDIO_KEY", "name of the env var holding the Gemini API key")
+	apiKeyEnv := fs.String("api-key-env", "GEMINI_API_KEY", "name of the env var holding the Gemini API key")
 	model := fs.String("model", "gemini-3.5-flash-lite", "Gemini model id")
 	baseURL := fs.String("base-url", "", "override the Interactions API base URL (default: real endpoint)")
 	delay := fs.Duration("delay", 200*time.Millisecond, "pause between API calls")

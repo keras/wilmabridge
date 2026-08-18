@@ -154,7 +154,7 @@ from a persistent pending queue instead and save the results — see "Persistenc
 ### Credentials
 
 ```sh
-export AISTUDIO_KEY=your-google-ai-studio-api-key
+export GEMINI_API_KEY=your-google-ai-studio-api-key
 ```
 
 **Tier matters.** Google's free tier states prompts/responses may be used to improve
@@ -169,7 +169,7 @@ drift into the free tier by default. (Confirmed live: this project hit the free 
 
 | flag | default | meaning |
 |---|---|---|
-| `--api-key-env` | `AISTUDIO_KEY` | name of the env var holding the API key |
+| `--api-key-env` | `GEMINI_API_KEY` | name of the env var holding the API key |
 | `--model` | `gemini-3.5-flash-lite` | Gemini model id |
 | `--base-url` | (real endpoint) | override, mainly for tests/a local proxy |
 | `--delay` | `200ms` | pause between API calls |
