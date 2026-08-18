@@ -4,4 +4,6 @@
 *.db-shm
 messages.json
 /wilmabridge
+/bin
+/dist
 openclaw-integration.md

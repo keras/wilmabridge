@@ -51,6 +51,9 @@ means it's a real C-to-Go transpile of SQLite rather than a thin wrapper, so it 
 ~10 supporting modules and noticeably lengthens build time — an accepted tradeoff for
 staying cgo-free, not a bug.
 
+Pushing a `vX.Y.Z` tag runs `.github/workflows/release.yml`, which builds a
+`linux/amd64` binary (`make dist`) and attaches it to a GitHub release.
+
 ## Credentials
 
 Read from the environment only — never from flags, so they never land in shell history
