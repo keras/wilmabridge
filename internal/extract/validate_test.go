@@ -30,25 +30,26 @@ func buildOneEvent(t *testing.T, src Source, c Candidate) Event {
 
 func TestParseDateRaw(t *testing.T) {
 	cases := []struct {
-		raw                string
-		wantDay, wantMonth int
-		wantOK             bool
+		raw                          string
+		wantDay, wantMonth, wantYear int
+		wantOK                       bool
 	}{
-		{"4.3.", 4, 3, true},
-		{"4.3", 4, 3, true}, // trailing dot optional
-		{"10.10.", 10, 10, true},
-		{"31.12.", 31, 12, true},
-		{"garbage", 0, 0, false},
-		{"", 0, 0, false},
-		{"4.3.2026", 0, 0, false}, // model must never send a year; reject if it does
-		{"32.1.", 0, 0, false},    // day out of range
-		{"1.13.", 0, 0, false},    // month out of range
+		{"4.3.", 4, 3, 0, true},
+		{"4.3", 4, 3, 0, true}, // trailing dot optional
+		{"10.10.", 10, 10, 0, true},
+		{"31.12.", 31, 12, 0, true},
+		{"garbage", 0, 0, 0, false},
+		{"", 0, 0, 0, false},
+		{"4.3.2026", 4, 3, 2026, true}, // explicit year in the source text is parsed, not rejected
+		{"1.9.2026", 1, 9, 2026, true},
+		{"32.1.", 0, 0, 0, false}, // day out of range
+		{"1.13.", 0, 0, 0, false}, // month out of range
 	}
 	for _, tc := range cases {
-		day, month, ok := parseDateRaw(tc.raw)
-		if ok != tc.wantOK || day != tc.wantDay || month != tc.wantMonth {
-			t.Errorf("parseDateRaw(%q) = (%d,%d,%v), want (%d,%d,%v)",
-				tc.raw, day, month, ok, tc.wantDay, tc.wantMonth, tc.wantOK)
+		day, month, year, ok := parseDateRaw(tc.raw)
+		if ok != tc.wantOK || day != tc.wantDay || month != tc.wantMonth || year != tc.wantYear {
+			t.Errorf("parseDateRaw(%q) = (%d,%d,%d,%v), want (%d,%d,%d,%v)",
+				tc.raw, day, month, year, ok, tc.wantDay, tc.wantMonth, tc.wantYear, tc.wantOK)
 		}
 	}
 }
@@ -70,7 +71,7 @@ func TestResolveDate_MonthlyLetterDates(t *testing.T) {
 		{20, 3, "2026-03-20", time.Friday},
 	}
 	for _, tc := range cases {
-		got, valid := resolveDate(sentAt, tc.day, tc.month)
+		got, valid := resolveDate(sentAt, tc.day, tc.month, 0)
 		if !valid {
 			t.Fatalf("resolveDate(%d.%d.) not valid", tc.day, tc.month)
 		}
@@ -87,7 +88,7 @@ func TestResolveDate_RollsToNextYear(t *testing.T) {
 	// A message sent in December referring to a January date should resolve
 	// forward into next year, not backward into the past.
 	sentAt := mustParseHelsinki(t, "2026-12-20")
-	got, valid := resolveDate(sentAt, 7, 1)
+	got, valid := resolveDate(sentAt, 7, 1, 0)
 	if !valid {
 		t.Fatal("not valid")
 	}
@@ -98,7 +99,7 @@ func TestResolveDate_RollsToNextYear(t *testing.T) {
 
 func TestResolveDate_SameDayCountsAsOnOrAfter(t *testing.T) {
 	sentAt := mustParseHelsinki(t, "2026-03-04")
-	got, valid := resolveDate(sentAt, 4, 3)
+	got, valid := resolveDate(sentAt, 4, 3, 0)
 	if !valid || got.Format("2006-01-02") != "2026-03-04" {
 		t.Errorf("resolveDate same-day = %v valid=%v, want 2026-03-04", got, valid)
 	}
@@ -108,9 +109,60 @@ func TestResolveDate_InvalidCalendarDate(t *testing.T) {
 	sentAt := mustParseHelsinki(t, "2026-04-01")
 	// April has 30 days; without the validity check, Go's time.Date would
 	// silently roll 31.4. into 1.5.
-	_, valid := resolveDate(sentAt, 31, 4)
+	_, valid := resolveDate(sentAt, 31, 4, 0)
 	if valid {
 		t.Error("31.4. should not resolve to a valid date")
+	}
+}
+
+// TestResolveDate_ExplicitYearUsedAsIs covers the fix for a raw date that
+// carries a year (e.g. "1.9.2026"): unlike the year==0 case, it must not be
+// anchored forward to the next occurrence on/after sentAt -- the message
+// already said which year it meant, even one before sentAt's year.
+func TestResolveDate_ExplicitYearUsedAsIs(t *testing.T) {
+	sentAt := mustParseHelsinki(t, "2026-03-01")
+	got, valid := resolveDate(sentAt, 1, 9, 2026)
+	if !valid {
+		t.Fatal("not valid")
+	}
+	if want := "2026-09-01"; got.Format("2006-01-02") != want {
+		t.Errorf("resolveDate = %s, want %s", got.Format("2006-01-02"), want)
+	}
+}
+
+func TestResolveDate_ExplicitYearInvalidCalendarDate(t *testing.T) {
+	sentAt := mustParseHelsinki(t, "2026-03-01")
+	_, valid := resolveDate(sentAt, 31, 4, 2026)
+	if valid {
+		t.Error("31.4.2026 should not resolve to a valid date")
+	}
+}
+
+func TestParseRelativeDate(t *testing.T) {
+	sentAt := mustParseHelsinki(t, "2026-03-04") // a Wednesday
+	cases := []struct {
+		raw      string
+		wantDate string
+		wantOK   bool
+	}{
+		{"tänään", "2026-03-04", true},
+		{"huomenna", "2026-03-05", true},
+		{"ylihuomenna", "2026-03-06", true},
+		{"HUOMENNA", "2026-03-05", true}, // case-insensitive, like normalizeWeekdayClaim
+		{" huomenna ", "2026-03-05", true},
+		{"ensi viikolla", "", false}, // vaguer phrases are deliberately not covered
+		{"keskiviikkona", "", false},
+		{"", "", false},
+	}
+	for _, tc := range cases {
+		got, ok := parseRelativeDate(tc.raw, sentAt)
+		if ok != tc.wantOK {
+			t.Errorf("parseRelativeDate(%q) ok = %v, want %v", tc.raw, ok, tc.wantOK)
+			continue
+		}
+		if ok && got.Format("2006-01-02") != tc.wantDate {
+			t.Errorf("parseRelativeDate(%q) = %s, want %s", tc.raw, got.Format("2006-01-02"), tc.wantDate)
+		}
 	}
 }
 
@@ -173,6 +225,42 @@ func TestBuildEvent_UnparseableDateFlaggedNotGuessed(t *testing.T) {
 	}
 	if !ev.NeedsReview {
 		t.Error("expected needs_review=true")
+	}
+}
+
+// TestBuildEvent_ExplicitYearParsed covers the reported failure: a message
+// containing a year, e.g. "1.9.2026", used to fail with `could not parse
+// date "1.9.2026"` because parseDateRaw rejected any year outright.
+func TestBuildEvent_ExplicitYearParsed(t *testing.T) {
+	sentAt := mustParseHelsinki(t, "2026-03-01")
+	c := Candidate{
+		Kind: "event", Title: "x", Date: "1.9.2026",
+		Audience: AudienceChild, Confidence: 1.0, Quote: "q",
+	}
+	ev := buildOneEvent(t, Source{SentAt: sentAt}, c)
+	if ev.ResolvedDate != "2026-09-01" {
+		t.Errorf("resolved_date = %q, want 2026-09-01", ev.ResolvedDate)
+	}
+	if ev.NeedsReview {
+		t.Errorf("unexpected needs_review, reasons=%v", ev.ReviewReasons)
+	}
+}
+
+// TestBuildEvent_RelativeDateHuomenna covers the requested "huomenna"
+// support: previously any relative-day word fell through to the generic
+// unparseable-date path.
+func TestBuildEvent_RelativeDateHuomenna(t *testing.T) {
+	sentAt := mustParseHelsinki(t, "2026-03-04")
+	c := Candidate{
+		Kind: "event", Title: "x", Date: "huomenna",
+		Audience: AudienceChild, Confidence: 1.0, Quote: "q",
+	}
+	ev := buildOneEvent(t, Source{SentAt: sentAt}, c)
+	if ev.ResolvedDate != "2026-03-05" {
+		t.Errorf("resolved_date = %q, want 2026-03-05", ev.ResolvedDate)
+	}
+	if ev.NeedsReview {
+		t.Errorf("unexpected needs_review, reasons=%v", ev.ReviewReasons)
 	}
 }
 

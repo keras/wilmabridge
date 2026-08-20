@@ -15,51 +15,95 @@ import (
 // retrospective-detection machinery for what should be a rare case.
 const farFutureThreshold = 270 * 24 * time.Hour // ~9 months
 
-var dateRawPattern = regexp.MustCompile(`^\s*(\d{1,2})\.(\d{1,2})\.?\s*$`)
+var dateRawPattern = regexp.MustCompile(`^\s*(\d{1,2})\.(\d{1,2})(?:\.(\d{4})?)?\s*$`)
 
-// parseDateRaw parses a bare Finnish day.month date like "4.3." or "10.10.".
-// It intentionally does not accept a year — the model is instructed never
-// to supply one (see prompt.go), so a raw value carrying one is treated as
-// unparseable rather than silently accepted in some other format.
-func parseDateRaw(raw string) (day, month int, ok bool) {
+// parseDateRaw parses a bare Finnish day.month date like "4.3." or "10.10.",
+// optionally followed by a 4-digit year like "1.9.2026". year is 0 when the
+// raw text didn't carry one — the model is told never to fabricate a year,
+// but school messages sometimes do include one in the source text (e.g.
+// "1.9.2026"), and that's a real, parseable date rather than something to
+// reject; resolveDate treats year==0 as "anchor forward from sentAt" and a
+// nonzero year as an explicit, authoritative value.
+func parseDateRaw(raw string) (day, month, year int, ok bool) {
 	m := dateRawPattern.FindStringSubmatch(raw)
 	if m == nil {
-		return 0, 0, false
+		return 0, 0, 0, false
 	}
 	var d, mo int
 	if _, err := fmt.Sscanf(m[1], "%d", &d); err != nil {
-		return 0, 0, false
+		return 0, 0, 0, false
 	}
 	if _, err := fmt.Sscanf(m[2], "%d", &mo); err != nil {
-		return 0, 0, false
+		return 0, 0, 0, false
 	}
 	if mo < 1 || mo > 12 || d < 1 || d > 31 {
-		return 0, 0, false
+		return 0, 0, 0, false
 	}
-	return d, mo, true
+	var y int
+	if m[3] != "" {
+		if _, err := fmt.Sscanf(m[3], "%d", &y); err != nil {
+			return 0, 0, 0, false
+		}
+	}
+	return d, mo, y, true
 }
 
-// resolveDate anchors (day, month) to the next occurrence on or after
-// sentAt's calendar date, per the design's single rule: real school
-// messages refer to near-term events, so no weekday-based disambiguation is
-// needed — see openclaw-integration.md's "Year resolution — one rule".
-//
-// valid is false if (day, month) is not a real calendar date in either
-// candidate year (e.g. day=31, month=4): Go's time.Date silently normalizes
-// out-of-range days into the following month, which would otherwise turn a
-// misread "31.4." into a confidently-wrong "1.5." with no signal that
-// anything was off.
-func resolveDate(sentAt time.Time, day, month int) (resolved time.Time, valid bool) {
+// finnishRelativeDayOffset maps the near-term relative-day words school
+// messages actually use ("koe on huomenna") to an offset in days from the
+// message's send date. Weekday names ("keskiviikkona") and vaguer phrases
+// ("ensi viikolla") are deliberately not covered — the model isn't asked to
+// normalize those, and guessing at them risks a confidently wrong date with
+// no signal anything was off.
+var finnishRelativeDayOffset = map[string]int{
+	"tänään":      0,
+	"huomenna":    1,
+	"ylihuomenna": 2,
+}
+
+// parseRelativeDate resolves a bare relative-day word against sentAt's
+// calendar date. ok is false for anything not in finnishRelativeDayOffset.
+func parseRelativeDate(raw string, sentAt time.Time) (resolved time.Time, ok bool) {
+	offset, found := finnishRelativeDayOffset[strings.ToLower(strings.TrimSpace(raw))]
+	if !found {
+		return time.Time{}, false
+	}
 	loc := sentAt.Location()
 	if loc == nil {
 		loc = time.UTC
 	}
 	sentDate := time.Date(sentAt.Year(), sentAt.Month(), sentAt.Day(), 0, 0, 0, 0, loc)
+	return sentDate.AddDate(0, 0, offset), true
+}
 
-	try := func(year int) (time.Time, bool) {
-		t := time.Date(year, time.Month(month), day, 0, 0, 0, 0, loc)
+// resolveDate turns (day, month, year) into a concrete date. When year is 0
+// (not present in the raw text), it anchors (day, month) to the next
+// occurrence on or after sentAt's calendar date, per the design's single
+// rule: real school messages refer to near-term events, so no weekday-based
+// disambiguation is needed — see openclaw-integration.md's "Year resolution
+// — one rule". When year is nonzero (the raw text carried one, e.g.
+// "1.9.2026"), it's used as-is rather than anchored/guessed — the message
+// already said which year it meant.
+//
+// valid is false if (day, month[, year]) is not a real calendar date: Go's
+// time.Date silently normalizes out-of-range days into the following
+// month, which would otherwise turn a misread "31.4." into a confidently-
+// wrong "1.5." with no signal that anything was off.
+func resolveDate(sentAt time.Time, day, month, year int) (resolved time.Time, valid bool) {
+	loc := sentAt.Location()
+	if loc == nil {
+		loc = time.UTC
+	}
+
+	try := func(y int) (time.Time, bool) {
+		t := time.Date(y, time.Month(month), day, 0, 0, 0, 0, loc)
 		return t, int(t.Month()) == month && t.Day() == day
 	}
+
+	if year != 0 {
+		return try(year)
+	}
+
+	sentDate := time.Date(sentAt.Year(), sentAt.Month(), sentAt.Day(), 0, 0, 0, 0, loc)
 
 	candidate, ok := try(sentAt.Year())
 	if !ok {
@@ -222,19 +266,22 @@ func BuildEvent(src Source, c Candidate) []Event {
 		base.ReviewReasons = append(base.ReviewReasons, fmt.Sprintf("audience missing or unrecognized (%q), defaulting to child", c.Audience))
 	}
 
-	day, month, ok := parseDateRaw(c.Date)
-	if !ok {
+	var firstOccurrence time.Time
+	if day, month, year, ok := parseDateRaw(c.Date); ok {
+		resolved, valid := resolveDate(src.SentAt, day, month, year)
+		if !valid {
+			ev := base
+			ev.NeedsReview = true
+			ev.ReviewReasons = append(ev.ReviewReasons, fmt.Sprintf("%q is not a real calendar date", c.Date))
+			return []Event{ev}
+		}
+		firstOccurrence = resolved
+	} else if rel, relOK := parseRelativeDate(c.Date, src.SentAt); relOK {
+		firstOccurrence = rel
+	} else {
 		ev := base
 		ev.NeedsReview = true
 		ev.ReviewReasons = append(ev.ReviewReasons, fmt.Sprintf("could not parse date %q", c.Date))
-		return []Event{ev}
-	}
-
-	firstOccurrence, valid := resolveDate(src.SentAt, day, month)
-	if !valid {
-		ev := base
-		ev.NeedsReview = true
-		ev.ReviewReasons = append(ev.ReviewReasons, fmt.Sprintf("%q is not a real calendar date", c.Date))
 		return []Event{ev}
 	}
 

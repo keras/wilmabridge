@@ -18,9 +18,17 @@ import "encoding/json"
 // model's request shape for recurrence itself (still {freq,count}) is
 // unchanged; only what Go does with it changed.
 //
+// ver 4: parseDateRaw (validate.go) now accepts an explicit year in the raw
+// date (e.g. "1.9.2026") instead of rejecting it, and a new
+// parseRelativeDate understands "tänään"/"huomenna"/"ylihuomenna". The
+// "date" field's schema description was widened to show these forms as
+// examples. Messages extracted under ver 3 that were flagged with "could
+// not parse date" for a year-bearing or relative-word date are candidates
+// for `wilmabridge reextract`.
+//
 // Every message extracted under an older ver is a candidate for
 // `wilmabridge reextract`.
-const ExtractVer = 3
+const ExtractVer = 4
 
 // responseSchema is the JSON Schema handed to Gemini as response_format.schema.
 //
@@ -73,7 +81,7 @@ var responseSchema = json.RawMessage(`{
           },
           "date": {
             "type": "string",
-            "description": "Päivämäärä TÄSMÄLLEEN viestissä kirjoitetussa muodossa, esim. \"4.3.\" tai \"10.10.\". Älä päättele tai lisää vuotta."
+            "description": "Päivämäärä TÄSMÄLLEEN viestissä kirjoitetussa muodossa, esim. \"4.3.\", \"10.10.\", \"1.9.2026\" tai \"huomenna\". Älä päättele tai lisää vuotta jos sitä ei ole kirjoitettu viestissä."
           },
           "weekday_claim": {
             "type": "string",
